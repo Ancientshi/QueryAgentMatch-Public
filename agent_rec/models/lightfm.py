@@ -195,10 +195,20 @@ class LightFM(RecommenderBase):
             neg = neg + self.bias_q(q_idx).squeeze(-1) + self.bias_a(neg_idx).squeeze(-1)
         return pos, neg
 
-    def export_agent_embeddings(self) -> np.ndarray:
+    def export_agent_embeddings(self, batch_size: Optional[int] = 4096) -> np.ndarray:
         with torch.no_grad():
-            a_idx = torch.arange(self.emb_a.num_embeddings, device=self.device, dtype=torch.long)
-            return self.item_repr_batch(a_idx).detach().cpu().numpy().astype(np.float32)
+            num_items = self.emb_a.num_embeddings
+            if batch_size is None or batch_size >= num_items:
+                a_idx = torch.arange(num_items, device=self.device, dtype=torch.long)
+                return self.item_repr_batch(a_idx).detach().cpu().numpy().astype(np.float32)
+
+            chunks: List[np.ndarray] = []
+            for start in range(0, num_items, batch_size):
+                end = min(start + batch_size, num_items)
+                a_idx = torch.arange(start, end, device=self.device, dtype=torch.long)
+                chunk = self.item_repr_batch(a_idx).detach().cpu().numpy().astype(np.float32)
+                chunks.append(chunk)
+            return np.concatenate(chunks, axis=0)
 
     def export_query_embeddings(self, q_indices: Sequence[int]) -> np.ndarray:
         with torch.no_grad():
