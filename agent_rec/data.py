@@ -81,6 +81,13 @@ def collect_data(data_root: str, parts: Optional[List[str]] = None) -> DatasetBu
     )
 
 
+def load_tools(data_root: str) -> Dict[str, dict]:
+    tools_path = os.path.join(data_root, "Tools", "merge.json")
+    if os.path.exists(tools_path):
+        return load_json(tools_path)
+    return {}
+
+
 def qids_with_rankings(q_ids: List[str], rankings: Dict[str, List[str]]) -> List[str]:
     return [qid for qid in q_ids if qid in rankings]
 
