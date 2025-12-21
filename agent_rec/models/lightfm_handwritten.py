@@ -70,21 +70,27 @@ class LightFMHandwritten(RecommenderBase):
         num_a: int,
         num_user_feats: int,
         num_item_feats: int,
+        num_tool_ids: int = 0,
         factors: int = 128,
         add_bias: bool = True,
         alpha_id: float = 1.0,
         alpha_feat: float = 1.0,
+        alpha_tool: float = 1.0,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
         self.add_bias = add_bias
         self.alpha_id = nn.Parameter(torch.tensor(alpha_id, dtype=torch.float32))
         self.alpha_feat = nn.Parameter(torch.tensor(alpha_feat, dtype=torch.float32))
+        self.alpha_tool = nn.Parameter(torch.tensor(alpha_tool, dtype=torch.float32))
+        self.use_tool_id_emb = num_tool_ids > 0
 
         self.emb_q = nn.Embedding(num_q, factors)
         self.emb_a = nn.Embedding(num_a, factors)
         self.emb_user_feat = nn.EmbeddingBag(num_user_feats, factors, mode="sum", include_last_offset=True)
         self.emb_item_feat = nn.EmbeddingBag(num_item_feats, factors, mode="sum", include_last_offset=True)
+        if self.use_tool_id_emb:
+            self.emb_tool = nn.Embedding(num_tool_ids, factors)
 
         if add_bias:
             self.bias_q = nn.Embedding(num_q, 1)
@@ -97,12 +103,16 @@ class LightFMHandwritten(RecommenderBase):
         self.user_vals_per_row: Optional[List[List[float]]] = None
         self.item_feats_per_row: Optional[List[List[int]]] = None
         self.item_vals_per_row: Optional[List[List[float]]] = None
+        self.item_tool_ids: Optional[torch.LongTensor] = None
+        self.item_tool_mask: Optional[torch.FloatTensor] = None
 
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.emb_q.weight)
         nn.init.xavier_uniform_(self.emb_a.weight)
         nn.init.xavier_uniform_(self.emb_user_feat.weight)
         nn.init.xavier_uniform_(self.emb_item_feat.weight)
+        if self.use_tool_id_emb:
+            nn.init.xavier_uniform_(self.emb_tool.weight)
         if self.add_bias:
             nn.init.zeros_(self.bias_q.weight)
             nn.init.zeros_(self.bias_a.weight)
@@ -114,6 +124,23 @@ class LightFMHandwritten(RecommenderBase):
     def set_item_feat_lists(self, feats_per_row: List[List[int]], vals_per_row: List[List[float]]) -> None:
         self.item_feats_per_row = feats_per_row
         self.item_vals_per_row = vals_per_row
+
+    def set_item_tool_id_buffers(self, tool_ids: torch.LongTensor, tool_mask: torch.FloatTensor) -> None:
+        self.item_tool_ids = tool_ids
+        self.item_tool_mask = tool_mask
+
+    def _mean_embed_tools(self, a_idx: torch.LongTensor) -> torch.Tensor:
+        if not self.use_tool_id_emb:
+            raise RuntimeError("Tool ID embedding not enabled.")
+        if self.item_tool_ids is None or self.item_tool_mask is None:
+            raise RuntimeError("Item tool buffers not set.")
+        tool_ids = self.item_tool_ids[a_idx]
+        tool_mask = self.item_tool_mask[a_idx]
+        tool_emb = self.emb_tool(tool_ids)
+        tool_mask = tool_mask.unsqueeze(-1)
+        weighted = tool_emb * tool_mask
+        denom = tool_mask.sum(dim=1).clamp_min(1.0)
+        return weighted.sum(dim=1) / denom
 
     def _bag_embed_users(self, q_idx: torch.LongTensor) -> torch.Tensor:
         if self.user_feats_per_row is None or self.user_vals_per_row is None:
@@ -145,7 +172,10 @@ class LightFMHandwritten(RecommenderBase):
     def item_repr_batch(self, a_idx: torch.LongTensor) -> torch.Tensor:
         i_id = self.emb_a(a_idx)
         i_feat = self._bag_embed_items(a_idx)
-        return self.alpha_id * i_id + self.alpha_feat * i_feat
+        out = self.alpha_id * i_id + self.alpha_feat * i_feat
+        if self.use_tool_id_emb:
+            out = out + self.alpha_tool * self._mean_embed_tools(a_idx)
+        return out
 
     def forward(
         self,
@@ -181,4 +211,4 @@ class LightFMHandwritten(RecommenderBase):
         return None
 
     def extra_state_dict(self) -> Dict[str, Any]:
-        return {"add_bias": bool(self.add_bias)}
+        return {"add_bias": bool(self.add_bias), "use_tool_id_emb": bool(self.use_tool_id_emb)}

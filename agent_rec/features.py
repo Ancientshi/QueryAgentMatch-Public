@@ -54,9 +54,7 @@ def build_text_corpora(
         mname = ((a.get("M") or {}).get("name") or "").strip()
         tool_list = ((a.get("T") or {}).get("tools") or [])
         a_tool_lists.append(tool_list)
-        concat_tool_desc = " ".join([tool_text(name) for name in tool_list])
-        text = f"{mname} {concat_tool_desc}".strip()
-        a_texts.append(text)
+        a_texts.append(mname)
 
     return q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists
 

@@ -25,6 +25,7 @@ from agent_rec.data import (
     load_tools,
 )
 from agent_rec.features import (
+    build_agent_tool_id_buffers,
     build_feature_cache,
     build_text_corpora,
     feature_cache_exists,
@@ -63,6 +64,8 @@ def main():
 
     parser.add_argument("--user_features_path", type=str, default="")
     parser.add_argument("--item_features_path", type=str, default="")
+    parser.add_argument("--use_tool_id_emb", type=int, default=0)
+    parser.add_argument("--alpha_tool", type=float, default=1.0)
 
     parser.add_argument("--knn_N", type=int, default=8)
     parser.add_argument("--eval_cand_size", type=int, default=100)
@@ -83,6 +86,7 @@ def main():
     qid_to_part = bundle.qid_to_part
 
     tools = load_tools(args.data_root)
+    tool_names = list(tools.keys())
 
     print(
         f"Loaded {len(all_agents)} agents, {len(all_questions)} questions, "
@@ -126,6 +130,17 @@ def main():
             raise ValueError("CSR rows mismatch between provided features and data.")
         feature_cache = None
         q_vectorizer_runtime = None
+
+    tool_id_buffers = None
+    if args.use_tool_id_emb:
+        if feature_cache is not None:
+            tool_id_buffers = (
+                feature_cache.agent_tool_idx_padded,
+                feature_cache.agent_tool_mask,
+            )
+        else:
+            _, _, _, _, _, _, a_tool_lists = build_text_corpora(all_agents, all_questions, tools)
+            tool_id_buffers = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
 
     if feature_cache is None:
         Q_np = U.toarray().astype(np.float32)
@@ -198,14 +213,21 @@ def main():
         num_a=len(a_ids),
         num_user_feats=num_user_feats,
         num_item_feats=num_item_feats,
+        num_tool_ids=len(tool_names) if args.use_tool_id_emb else 0,
         factors=args.factors,
         add_bias=True,
         alpha_id=args.alpha_id,
         alpha_feat=args.alpha_feat,
+        alpha_tool=args.alpha_tool,
         device=device,
     ).to(device)
     model.set_user_feat_lists(u_feats_per_row, u_vals_per_row)
     model.set_item_feat_lists(i_feats_per_row, i_vals_per_row)
+    if args.use_tool_id_emb and tool_id_buffers is not None:
+        tool_ids_np, tool_mask_np = tool_id_buffers
+        tool_ids = torch.tensor(tool_ids_np, dtype=torch.long, device=device)
+        tool_mask = torch.tensor(tool_mask_np, dtype=torch.float32, device=device)
+        model.set_item_tool_id_buffers(tool_ids, tool_mask)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
