@@ -31,6 +31,25 @@ def build_knn_cache(
         pickle.dump(knn_cache, f)
 
 
+def build_knn_cache_with_vectorizer(
+    train_qids: List[str],
+    all_questions: Dict[str, dict],
+    qid2idx: Dict[str, int],
+    model: RecommenderBase,
+    cache_path: str,
+    tfidf: TfidfVectorizer,
+) -> None:
+    train_texts = [all_questions[qid].get("input", "") for qid in train_qids]
+    X = tfidf.transform(train_texts).astype(np.float32)
+
+    q_indices = [qid2idx[qid] for qid in train_qids]
+    Q = model.export_query_embeddings(q_indices)
+
+    knn_cache = {"train_qids": train_qids, "tfidf": tfidf, "X": X, "Q": Q}
+    with open(cache_path, "wb") as f:
+        pickle.dump(knn_cache, f)
+
+
 def load_knn_cache(cache_path: str) -> Dict[str, Any]:
     with open(cache_path, "rb") as f:
         return pickle.load(f)
