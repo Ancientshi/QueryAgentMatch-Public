@@ -57,6 +57,7 @@ class BPRMF(RecommenderBase):
         neg = self.score_embeddings(qv, anv, q_idx, neg_idx)
         return pos, neg
 
+    # ---- RecommenderBase ----
     def export_agent_embeddings(self) -> np.ndarray:
         return self.emb_a.weight.detach().cpu().numpy().astype(np.float32)
 

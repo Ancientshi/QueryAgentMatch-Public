@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import random
 import zlib
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -61,8 +61,15 @@ def evaluate_sampled_knn_top10(
     seed: int = 123,
     desc: str = "Evaluating",
 ) -> Dict[int, Dict[str, float]]:
-    A = model.export_agent_embeddings()
-    bias_a = model.export_agent_bias()
+    """
+    Sampled eval with fixed top10:
+      - candidates = positives ∪ random negatives to cand_size
+      - qv via TF-IDF KNN weighted avg of train Q latent vectors
+      - score on candidate subset
+    Return format aligned with print_metrics_table: {10: {...}}
+    """
+    A = model.export_agent_embeddings()                  # (Na,F)
+    bias_a = model.export_agent_bias()                   # (Na,) or None
 
     all_agents = list(aid2idx.keys())
     all_agent_set = set(all_agents)
@@ -93,7 +100,7 @@ def evaluate_sampled_knn_top10(
             cand = gt
 
         qtext = all_questions.get(qid, {}).get("input", "")
-        qv = knn_qvec_for_question_text(qtext, knn_cache, N=knn_N)
+        qv = knn_qvec_for_question_text(qtext, knn_cache, N=knn_N)  # (F,)
 
         ai_idx = np.array([aid2idx[a] for a in cand], dtype=np.int64)
         s = score_candidates(A, qv, ai_idx, bias_a=bias_a, mode=score_mode)

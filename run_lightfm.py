@@ -37,7 +37,7 @@ from agent_rec.features import (
 )
 from agent_rec.knn import build_knn_cache, build_knn_cache_with_vectorizer, load_knn_cache
 from agent_rec.eval import evaluate_sampled_knn_top10, split_eval_qids_by_part
-from agent_rec.models.lightfm_handwritten import LightFMHandwritten, bpr_loss, csr_to_bag_lists
+from agent_rec.models.lightfm import LightFM, bpr_loss, csr_to_bag_lists
 
 from utils import print_metrics_table  # 依赖你现有 utils.py
 
@@ -45,7 +45,7 @@ from utils import print_metrics_table  # 依赖你现有 utils.py
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--exp_name", type=str, default="lightfm_handwritten", help="Cache folder name under .cache/")
+    parser.add_argument("--exp_name", type=str, default="lightfm", help="Cache folder name under .cache/")
     parser.add_argument("--factors", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=4096)
@@ -67,7 +67,7 @@ def main():
     parser.add_argument("--use_tool_id_emb", type=int, default=0)
     parser.add_argument("--alpha_tool", type=float, default=1.0)
 
-    parser.add_argument("--knn_N", type=int, default=8)
+    parser.add_argument("--knn_N", type=int, default=3)
     parser.add_argument("--eval_cand_size", type=int, default=100)
     parser.add_argument("--topk", type=int, default=EVAL_TOPK, help="Fixed to 10 by default")
 
@@ -208,7 +208,7 @@ def main():
         print(f"[cache] saved train/valid/pairs to {cache_dir}")
 
     device = torch.device(args.device)
-    model = LightFMHandwritten(
+    model = LightFM(
         num_q=len(q_ids),
         num_a=len(a_ids),
         num_user_feats=num_user_feats,

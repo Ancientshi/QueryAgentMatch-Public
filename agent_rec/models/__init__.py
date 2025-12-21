@@ -1,1 +1,1 @@
-# models subpackage
+# agent_rec/models/__init__.py

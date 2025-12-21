@@ -12,12 +12,15 @@ ScoreMode = Literal["dot", "cosine"]
 
 
 def score_candidates(
-    A: np.ndarray,
-    qv: np.ndarray,
-    ai_idx: np.ndarray,
-    bias_a: Optional[np.ndarray] = None,
+    A: np.ndarray,              # (Na,F)
+    qv: np.ndarray,             # (F,)
+    ai_idx: np.ndarray,         # (Ncand,)
+    bias_a: Optional[np.ndarray] = None,  # (Na,)
     mode: ScoreMode = "dot",
 ) -> np.ndarray:
+    """
+    Score a subset of agents.
+    """
     if mode == "dot":
         s = A[ai_idx] @ qv.astype(np.float32)
     elif mode == "cosine":

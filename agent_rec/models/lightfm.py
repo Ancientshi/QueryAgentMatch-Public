@@ -61,7 +61,7 @@ def build_bag_tensors(
     return idx_t, off_t, w_t
 
 
-class LightFMHandwritten(RecommenderBase):
+class LightFM(RecommenderBase):
     """Hybrid MF with ID embeddings + sparse user/item feature embeddings."""
 
     def __init__(
