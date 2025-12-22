@@ -8,6 +8,7 @@ import zlib
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
 from tqdm.auto import tqdm
 
 from .config import POS_TOPK, EVAL_TOPK
@@ -135,3 +136,90 @@ def split_eval_qids_by_part(eval_qids: List[str], qid_to_part: Dict[str, str]) -
     for qid in eval_qids:
         out.setdefault(qid_to_part.get(qid, "Unknown"), []).append(qid)
     return out
+
+
+@np.errstate(all="ignore")
+def evaluate_sampled_direct_top10(
+    model,
+    aid2idx: Dict[str, int],
+    all_rankings: Dict[str, List[str]],
+    all_questions: Dict[str, dict],
+    eval_qids: List[str],
+    q_vectorizer,
+    A_text_full: np.ndarray,
+    cand_size: int = 100,
+    pos_topk: int = POS_TOPK,
+    topk: int = EVAL_TOPK,
+    seed: int = 123,
+    desc: str = "Evaluating",
+) -> Dict[int, Dict[str, float]]:
+    """
+    Sampled eval with fixed top10:
+      - candidates = positives ∪ random negatives to cand_size
+      - qv via TF-IDF vectorizer on question text
+      - model scores directly with query + agent text features (no KNN)
+    Return format aligned with print_metrics_table: {10: {...}}
+    """
+    device = next(model.parameters()).device
+    A_t = torch.tensor(A_text_full, dtype=torch.float32, device=device)
+
+    all_agents = list(aid2idx.keys())
+    all_agent_set = set(all_agents)
+
+    agg = {m: 0.0 for m in ["P", "R", "F1", "Hit", "nDCG", "MRR"]}
+    cnt, skipped = 0, 0
+
+    pbar = tqdm(eval_qids, desc=desc, leave=True, dynamic_ncols=True)
+    for qid in pbar:
+        gt = [aid for aid in all_rankings.get(qid, [])[:pos_topk] if aid in aid2idx]
+        if not gt:
+            skipped += 1
+            pbar.set_postfix({"done": cnt, "skipped": skipped})
+            continue
+
+        rel_set = set(gt)
+        neg_pool = list(all_agent_set - rel_set)
+
+        qid_seed = (zlib.crc32(str(qid).encode("utf-8")) ^ (seed * 2654435761)) & 0xFFFFFFFF
+        rnd = random.Random(qid_seed)
+
+        need_neg = max(0, cand_size - len(gt))
+        if need_neg > 0 and neg_pool:
+            k = min(need_neg, len(neg_pool))
+            sampled_negs = rnd.sample(neg_pool, k)
+            cand = gt + sampled_negs
+        else:
+            cand = gt
+
+        qtext = all_questions.get(qid, {}).get("input", "")
+        qv_np = q_vectorizer.transform([qtext]).toarray().astype(np.float32)[0]
+        qv = torch.tensor(qv_np, dtype=torch.float32, device=device).unsqueeze(0)
+
+        ai_idx = torch.tensor([aid2idx[a] for a in cand], dtype=torch.long, device=device)
+        qv_rep = qv.repeat(len(cand), 1)
+        with torch.no_grad():
+            scores = model.forward_score(qv_rep, A_t[ai_idx], ai_idx).detach().cpu().numpy()
+        order = np.argsort(-scores)[:topk]
+        pred = [cand[i] for i in order]
+
+        met = _metrics_at_k(pred, rel_set, topk)
+        for m in agg:
+            agg[m] += met[m]
+        cnt += 1
+
+        pbar.set_postfix({
+            "done": cnt,
+            "skipped": skipped,
+            f"P@{topk}": f"{(agg['P']/cnt):.4f}",
+            f"nDCG@{topk}": f"{(agg['nDCG']/cnt):.4f}",
+            f"MRR@{topk}": f"{(agg['MRR']/cnt):.4f}",
+            "Ncand": len(cand),
+        })
+
+    if cnt == 0:
+        return {topk: {m: 0.0 for m in agg}}
+
+    for m in agg:
+        agg[m] /= cnt
+
+    return {topk: agg}
