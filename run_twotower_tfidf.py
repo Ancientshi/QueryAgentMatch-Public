@@ -43,6 +43,7 @@ from agent_rec.features import (
     save_feature_cache,
     save_q_vectorizer,
 )
+from agent_rec.eval import split_eval_qids_by_part
 from agent_rec.models.two_tower import TwoTowerTFIDF
 
 from utils import print_metrics_table
@@ -220,6 +221,7 @@ def main() -> None:
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings
+    qid_to_part = bundle.qid_to_part
 
     tools = load_tools(args.data_root)
     print(
@@ -392,6 +394,7 @@ def main() -> None:
     print(f"[save] model -> {model_path}")
     print(f"[save] meta  -> {meta_path}")
 
+    topk = int(args.topk)
     valid_metrics = evaluate_sampled_twotower(
         encoder,
         Q_cpu,
@@ -401,12 +404,37 @@ def main() -> None:
         all_rankings,
         valid_qids,
         device=device,
-        ks=(5, 10, 50),
+        ks=(topk,),
         cand_size=1000,
         rng_seed=123,
         amp=use_amp,
     )
-    print_metrics_table("Validation (averaged over questions)", valid_metrics, ks=(5, 10, 50), filename="two_tower")
+    print_metrics_table(
+        "Validation Overall (averaged over questions)", valid_metrics, ks=(topk,), filename="two_tower"
+    )
+
+    part_splits = split_eval_qids_by_part(valid_qids, qid_to_part=qid_to_part)
+    for part in ["PartI", "PartII", "PartIII"]:
+        qids_part = part_splits.get(part, [])
+        if not qids_part:
+            continue
+        m_part = evaluate_sampled_twotower(
+            encoder,
+            Q_cpu,
+            A_cpu,
+            qid2idx,
+            a_ids,
+            all_rankings,
+            qids_part,
+            device=device,
+            ks=(topk,),
+            cand_size=1000,
+            rng_seed=123,
+            amp=use_amp,
+        )
+        print_metrics_table(
+            f"Validation {part} (averaged over questions)", m_part, ks=(topk,), filename="two_tower"
+        )
 
     @torch.no_grad()
     def recommend_topk_for_qid(qid: str, topk: int = 10, chunk: int = 8192):
