@@ -251,7 +251,7 @@ def main():
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--valid_ratio", type=float, default=0.2)
     parser.add_argument("--topk", type=int, default=EVAL_TOPK)
-    parser.add_argument("--eval_cand_size", type=int, default=1000)
+    parser.add_argument("--eval_cand_size", type=int, default=100)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--rebuild_training_cache", type=int, default=0)
     parser.add_argument("--rebuild_embedding_cache", type=int, default=0)
