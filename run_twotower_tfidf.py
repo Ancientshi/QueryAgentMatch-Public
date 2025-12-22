@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Two-Tower TF-IDF Agent Recommender (InfoNCE) — OOM-safe version.
+
+Key points:
+1) Keep TF-IDF tensors on CPU; move ONLY the current batch to GPU.
+2) Evaluation & inference are chunked over agents (no full-matrix move to GPU).
+3) Added --eval_chunk to control agent-encoding batch size (default 8192).
+4) Added --amp to optionally enable autocast(bfloat16) on CUDA.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import random
+from contextlib import nullcontext
+from datetime import datetime
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+from agent_rec.config import POS_TOPK, EVAL_TOPK, TFIDF_MAX_FEATURES
+from agent_rec.data import (
+    collect_data,
+    dataset_signature,
+    ensure_cache_dir,
+    load_tools,
+    qids_with_rankings,
+    stratified_train_valid_split,
+)
+from agent_rec.features import (
+    build_twotower_feature_cache,
+    feature_cache_exists,
+    load_feature_cache,
+    load_q_vectorizer,
+    save_feature_cache,
+    save_q_vectorizer,
+)
+from agent_rec.models.two_tower import TwoTowerTFIDF
+
+from utils import print_metrics_table
+
+
+def info_nce_loss(qe: torch.Tensor, ae: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    logits = qe @ ae.t()
+    labels = torch.arange(qe.size(0), device=qe.device)
+    return torch.nn.functional.cross_entropy(logits / temperature, labels)
+
+
+def build_pos_pairs(
+    rankings: Dict[str, List[str]],
+    pos_topk: int = POS_TOPK,
+    rng_seed: int = 42,
+) -> List[Tuple[str, str]]:
+    rnd = random.Random(rng_seed)
+    pairs = []
+    for qid, ranked in rankings.items():
+        pos_list = ranked[:pos_topk] if ranked else []
+        for pos_a in pos_list:
+            pairs.append((qid, pos_a))
+    rnd.shuffle(pairs)
+    return pairs
+
+
+def training_cache_paths(cache_dir: str) -> Tuple[str, str, str, str]:
+    return (
+        os.path.join(cache_dir, "train_qids.json"),
+        os.path.join(cache_dir, "valid_qids.json"),
+        os.path.join(cache_dir, "pairs_train.npy"),
+        os.path.join(cache_dir, "train_cache_meta.json"),
+    )
+
+
+def training_cache_exists(cache_dir: str) -> bool:
+    return all(os.path.exists(p) for p in training_cache_paths(cache_dir))
+
+
+@torch.no_grad()
+def evaluate_sampled_twotower(
+    encoder: TwoTowerTFIDF,
+    Q_cpu: np.ndarray,
+    A_cpu: np.ndarray,
+    qid2idx: Dict[str, int],
+    a_ids: List[str],
+    all_rankings: Dict[str, List[str]],
+    eval_qids: List[str],
+    device: torch.device,
+    ks: Tuple[int, ...] = (5, 10, 50),
+    cand_size: int = 1000,
+    rng_seed: int = 123,
+    amp: bool = False,
+) -> Dict[int, Dict[str, float]]:
+    max_k = max(ks)
+    aid2idx = {aid: i for i, aid in enumerate(a_ids)}
+    agg = {k: {"P": 0.0, "R": 0.0, "F1": 0.0, "Hit": 0.0, "nDCG": 0.0, "MRR": 0.0} for k in ks}
+    cnt = 0
+    skipped = 0
+    ref_k = 10 if 10 in ks else max_k
+    all_agent_set = set(a_ids)
+
+    pbar = tqdm(eval_qids, desc="Evaluating (sampled)", leave=True, dynamic_ncols=True)
+    for qid in pbar:
+        gt_list = [aid for aid in all_rankings.get(qid, [])[:POS_TOPK] if aid in aid2idx]
+        if not gt_list:
+            skipped += 1
+            pbar.set_postfix({"done": cnt, "skipped": skipped})
+            continue
+        rel_set = set(gt_list)
+        neg_pool = list(all_agent_set - rel_set)
+
+        rnd = random.Random((hash(qid) ^ (rng_seed * 16777619)) & 0xFFFFFFFF)
+        need_neg = max(0, cand_size - len(gt_list))
+        cand_ids = gt_list + (
+            rnd.sample(neg_pool, min(need_neg, len(neg_pool))) if need_neg > 0 and neg_pool else []
+        )
+
+        qi = qid2idx[qid]
+        qv = torch.from_numpy(Q_cpu[qi : qi + 1]).to(device)
+        cand_idx = [aid2idx[a] for a in cand_ids]
+        av = torch.from_numpy(A_cpu[cand_idx]).to(device)
+
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if (amp and device.type == "cuda")
+            else nullcontext()
+        )
+        with autocast_ctx:
+            qe = encoder.encode_q(qv)
+            ae = encoder.encode_a(av, torch.tensor(cand_idx, device=device, dtype=torch.long))
+            scores = (qe @ ae.t()).float().squeeze(0).cpu().numpy()
+
+        order = np.argsort(-scores)[:max_k]
+        pred_ids = [cand_ids[i] for i in order]
+
+        bin_hits = [1 if aid in rel_set else 0 for aid in pred_ids]
+        num_rel = len(rel_set)
+        for k in ks:
+            top = bin_hits[:k]
+            Hk = sum(top)
+            P = Hk / float(k)
+            R = Hk / float(num_rel)
+            F1 = (2 * P * R) / (P + R) if (P + R) else 0.0
+            Hit = 1.0 if Hk > 0 else 0.0
+            dcg = sum(1.0 / math.log2(i + 2.0) for i, h in enumerate(top) if h)
+            ideal = min(k, num_rel)
+            idcg = sum(1.0 / math.log2(i + 2.0) for i in range(ideal)) if ideal else 0.0
+            nDCG = (dcg / idcg) if idcg > 0 else 0.0
+            rr = 0.0
+            for i, h in enumerate(top):
+                if h:
+                    rr = 1.0 / float(i + 1)
+                    break
+            agg[k]["P"] += P
+            agg[k]["R"] += R
+            agg[k]["F1"] += F1
+            agg[k]["Hit"] += Hit
+            agg[k]["nDCG"] += nDCG
+            agg[k]["MRR"] += rr
+
+        cnt += 1
+        ref = agg[ref_k]
+        pbar.set_postfix(
+            {
+                "done": cnt,
+                "skipped": skipped,
+                f"P@{ref_k}": f"{(ref['P'] / cnt):.4f}",
+                f"nDCG@{ref_k}": f"{(ref['nDCG'] / cnt):.4f}",
+                f"MRR@{ref_k}": f"{(ref['MRR'] / cnt):.4f}",
+                "Ncand": len(cand_ids),
+            }
+        )
+
+    if cnt == 0:
+        return {k: {m: 0.0 for m in ["P", "R", "F1", "Hit", "nDCG", "MRR"]} for k in ks}
+
+    for k in ks:
+        for m in agg[k]:
+            agg[k][m] /= cnt
+    return agg
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--exp_name", type=str, default="two_tower_tfidf")
+    parser.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
+    parser.add_argument("--hid", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument("--rng_seed_pairs", type=int, default=42)
+    parser.add_argument("--split_seed", type=int, default=42)
+    parser.add_argument("--valid_ratio", type=float, default=0.2)
+    parser.add_argument("--topk", type=int, default=EVAL_TOPK)
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--rebuild_feature_cache", type=int, default=0)
+    parser.add_argument("--rebuild_training_cache", type=int, default=0)
+    parser.add_argument("--eval_chunk", type=int, default=8192, help="batch size over agents for inference")
+    parser.add_argument("--amp", type=int, default=0, help="1 to enable autocast on CUDA (bfloat16)")
+    parser.add_argument("--use_tool_emb", type=int, default=1)
+    parser.add_argument("--use_agent_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
+    parser.add_argument("--agent_id_weight", type=float, default=0.5, help="scaling for agent-ID embedding")
+    args = parser.parse_args()
+
+    if args.topk != EVAL_TOPK:
+        print(f"[warn] You set --topk={args.topk}, but protocol suggests fixed top10. Proceeding.")
+
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.manual_seed(1234)
+
+    bundle = collect_data(args.data_root, parts=["PartI", "PartII", "PartIII"])
+    all_agents = bundle.all_agents
+    all_questions = bundle.all_questions
+    all_rankings = bundle.all_rankings
+
+    tools = load_tools(args.data_root)
+    print(
+        f"Loaded {len(all_agents)} agents, {len(all_questions)} questions, "
+        f"{len(all_rankings)} ranked entries, {len(tools)} tools."
+    )
+
+    q_ids = list(all_questions.keys())
+    a_ids = list(all_agents.keys())
+    qid2idx = {qid: i for i, qid in enumerate(q_ids)}
+    aid2idx = {aid: i for i, aid in enumerate(a_ids)}
+
+    qids_in_rank = qids_with_rankings(q_ids, all_rankings)
+    print(f"Questions with rankings: {len(qids_in_rank)} / {len(q_ids)}")
+
+    cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+
+    if feature_cache_exists(cache_dir) and args.rebuild_feature_cache == 0:
+        feature_cache = load_feature_cache(cache_dir)
+        q_vectorizer_runtime = load_q_vectorizer(cache_dir)
+        if q_vectorizer_runtime is None:
+            feature_cache, q_vectorizer_runtime = build_twotower_feature_cache(
+                all_agents, all_questions, tools, max_features=args.max_features
+            )
+            save_feature_cache(cache_dir, feature_cache)
+            save_q_vectorizer(cache_dir, q_vectorizer_runtime)
+    else:
+        feature_cache, q_vectorizer_runtime = build_twotower_feature_cache(
+            all_agents, all_questions, tools, max_features=args.max_features
+        )
+        save_feature_cache(cache_dir, feature_cache)
+        save_q_vectorizer(cache_dir, q_vectorizer_runtime)
+        print(f"[cache] saved features to {cache_dir}")
+
+    Q_cpu = feature_cache.Q.astype(np.float32)
+    A_cpu = feature_cache.A_text_full.astype(np.float32)
+    tool_ids_np = feature_cache.agent_tool_idx_padded
+    tool_mask_np = feature_cache.agent_tool_mask
+
+    want_meta = {
+        "data_sig": dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank}),
+        "pos_topk": int(POS_TOPK),
+        "rng_seed_pairs": int(args.rng_seed_pairs),
+        "split_seed": int(args.split_seed),
+        "valid_ratio": float(args.valid_ratio),
+        "pair_type": "q_pos_only_posTopK",
+    }
+
+    use_cache = training_cache_exists(cache_dir) and (args.rebuild_training_cache == 0)
+    if use_cache:
+        train_qids_path, valid_qids_path, pairs_path, meta_path = training_cache_paths(cache_dir)
+        with open(train_qids_path, "r", encoding="utf-8") as f:
+            train_qids = json.load(f)
+        with open(valid_qids_path, "r", encoding="utf-8") as f:
+            valid_qids = json.load(f)
+        pairs_idx_np = np.load(pairs_path)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta != want_meta:
+            use_cache = False
+
+    if not use_cache:
+        train_qids, valid_qids = stratified_train_valid_split(
+            qids_in_rank, qid_to_part=bundle.qid_to_part, valid_ratio=args.valid_ratio, seed=args.split_seed
+        )
+        pairs = build_pos_pairs({qid: all_rankings[qid] for qid in train_qids}, rng_seed=args.rng_seed_pairs)
+        pairs_idx = [(qid2idx[q], aid2idx[a]) for (q, a) in pairs]
+        pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
+
+        train_qids_path, valid_qids_path, pairs_path, meta_path = training_cache_paths(cache_dir)
+        with open(train_qids_path, "w", encoding="utf-8") as f:
+            json.dump(train_qids, f, ensure_ascii=False)
+        with open(valid_qids_path, "w", encoding="utf-8") as f:
+            json.dump(valid_qids, f, ensure_ascii=False)
+        np.save(pairs_path, pairs_idx_np)
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(want_meta, f, ensure_ascii=False, sort_keys=True)
+        print(f"[cache] saved train/valid/pairs to {cache_dir}")
+
+    device = torch.device(args.device)
+    encoder = TwoTowerTFIDF(
+        d_q=int(Q_cpu.shape[1]),
+        d_a=int(A_cpu.shape[1]),
+        num_tools=int(len(feature_cache.tool_names)),
+        agent_tool_idx_padded=torch.tensor(tool_ids_np, dtype=torch.long, device=device),
+        agent_tool_mask=torch.tensor(tool_mask_np, dtype=torch.float32, device=device),
+        hid=args.hid,
+        tool_emb=bool(args.use_tool_emb),
+        num_agents=len(a_ids),
+        use_agent_id_emb=bool(args.use_agent_id_emb),
+        agent_id_weight=args.agent_id_weight,
+    ).to(device)
+
+    optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
+
+    num_pairs = pairs_idx_np.shape[0]
+    num_batches = math.ceil(num_pairs / args.batch_size)
+    print(f"Training pairs: {num_pairs}, batches/epoch: {num_batches}")
+
+    use_amp = args.amp == 1 and device.type == "cuda"
+    for epoch in range(1, args.epochs + 1):
+        np.random.shuffle(pairs_idx_np)
+        total = 0.0
+        pbar = tqdm(range(num_batches), desc=f"Epoch {epoch}/{args.epochs}", dynamic_ncols=True)
+        encoder.train()
+        for b in pbar:
+            sl = slice(b * args.batch_size, min((b + 1) * args.batch_size, num_pairs))
+            batch = pairs_idx_np[sl]
+            if batch.size == 0:
+                continue
+            q_idx = batch[:, 0]
+            a_idx = batch[:, 1]
+
+            q_vec = torch.from_numpy(Q_cpu[q_idx]).to(device, non_blocking=True)
+            a_pos = torch.from_numpy(A_cpu[a_idx]).to(device, non_blocking=True)
+            a_idx_t = torch.from_numpy(a_idx).to(device, non_blocking=True)
+
+            autocast_ctx = (
+                torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+                if use_amp
+                else nullcontext()
+            )
+            with autocast_ctx:
+                qe = encoder.encode_q(q_vec)
+                ae = encoder.encode_a(a_pos, a_idx_t)
+                loss = info_nce_loss(qe, ae, temperature=args.temperature)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total += float(loss.item())
+            pbar.set_postfix({"batch_loss": f"{loss.item():.4f}", "avg_loss": f"{(total / (b + 1)):.4f}"})
+
+        print(f"Epoch {epoch}/{args.epochs} - InfoNCE: {(total / max(1, num_batches)):.4f}")
+
+    model_dir = os.path.join(cache_dir, "models")
+    os.makedirs(model_dir, exist_ok=True)
+    data_sig = want_meta["data_sig"]
+    model_path = os.path.join(model_dir, f"two_tower_tfidf_{data_sig}.pt")
+    latest_model = os.path.join(model_dir, f"latest_{data_sig}.pt")
+    meta_path = os.path.join(model_dir, f"meta_{data_sig}.json")
+
+    ckpt = {
+        "state_dict": encoder.state_dict(),
+        "data_sig": data_sig,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "args": vars(args),
+        "dims": {
+            "d_q": int(Q_cpu.shape[1]),
+            "d_a": int(A_cpu.shape[1]),
+            "hid": int(args.hid),
+            "num_tools": int(len(feature_cache.tool_names)),
+            "num_agents": int(len(a_ids)),
+        },
+        "flags": {
+            "use_tool_emb": bool(args.use_tool_emb),
+            "use_agent_id_emb": bool(args.use_agent_id_emb),
+            "agent_id_weight": float(args.agent_id_weight),
+        },
+        "mappings": {"q_ids": q_ids, "a_ids": a_ids, "tool_names": feature_cache.tool_names},
+    }
+    torch.save(ckpt, model_path)
+    torch.save(ckpt, latest_model)
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"data_sig": data_sig, "a_ids": a_ids, "tool_names": feature_cache.tool_names},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"[save] model -> {model_path}")
+    print(f"[save] meta  -> {meta_path}")
+
+    valid_metrics = evaluate_sampled_twotower(
+        encoder,
+        Q_cpu,
+        A_cpu,
+        qid2idx,
+        a_ids,
+        all_rankings,
+        valid_qids,
+        device=device,
+        ks=(5, 10, 50),
+        cand_size=1000,
+        rng_seed=123,
+        amp=use_amp,
+    )
+    print_metrics_table("Validation (averaged over questions)", valid_metrics, ks=(5, 10, 50), filename="two_tower")
+
+    @torch.no_grad()
+    def recommend_topk_for_qid(qid: str, topk: int = 10, chunk: int = 8192):
+        qi = qid2idx[qid]
+        qv = torch.from_numpy(Q_cpu[qi : qi + 1]).to(device)
+        qe = encoder.encode_q(qv)
+
+        best_scores: List[float] = []
+        best_ids: List[int] = []
+        num_agents = len(a_ids)
+        for i in range(0, num_agents, chunk):
+            j = min(i + chunk, num_agents)
+            a_idx = torch.arange(i, j, dtype=torch.long, device=device)
+            av = torch.from_numpy(A_cpu[i:j]).to(device)
+            ae = encoder.encode_a(av, a_idx)
+            scores = (qe @ ae.t()).squeeze(0)
+            k = min(topk, j - i)
+            top_scores, top_local_idx = torch.topk(scores, k)
+            best_scores.extend(top_scores.cpu().tolist())
+            best_ids.extend([i + int(t) for t in top_local_idx.cpu().tolist()])
+
+        best_scores_t = torch.tensor(best_scores)
+        best_ids_t = torch.tensor(best_ids)
+        k = min(topk, best_scores_t.numel())
+        final_scores, final_idx = torch.topk(best_scores_t, k)
+        result = [
+            (a_ids[int(best_ids_t[idx])], float(final_scores[n].item()))
+            for n, idx in enumerate(final_idx)
+        ]
+        return result
+
+    sample_qids = q_ids[: min(5, len(q_ids))]
+    for qid in sample_qids:
+        recs = recommend_topk_for_qid(qid, topk=args.topk, chunk=args.eval_chunk)
+        qtext = all_questions[qid]["input"][:80].replace("\n", " ")
+        print(f"\nQuestion: {qid}  |  {qtext}")
+        for r, (aid, s) in enumerate(recs, 1):
+            print(f"  {r:2d}. {aid:>20s}  score={s:.4f}")
+
+
+if __name__ == "__main__":
+    main()
