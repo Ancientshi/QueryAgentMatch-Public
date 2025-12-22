@@ -59,6 +59,36 @@ def build_text_corpora(
     return q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists
 
 
+def build_transformer_corpora(
+    all_agents: Dict[str, dict],
+    all_questions: Dict[str, dict],
+    tools: Dict[str, dict],
+) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[List[str]]]:
+    """Build transformer corpora with tool descriptions embedded in agent text."""
+    q_ids = list(all_questions.keys())
+    q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
+
+    tool_names = list(tools.keys())
+
+    def tool_text(name: str) -> str:
+        t = tools.get(name, {}) or {}
+        desc = t.get("description", "")
+        return f"{name} {desc}".strip()
+
+    a_ids = list(all_agents.keys())
+    a_texts: List[str] = []
+    a_tool_lists: List[List[str]] = []
+    for aid in a_ids:
+        a = all_agents.get(aid, {}) or {}
+        mname = ((a.get("M") or {}).get("name") or "").strip()
+        tool_list = ((a.get("T") or {}).get("tools") or [])
+        a_tool_lists.append(tool_list)
+        tools_concat = " ".join(tool_text(name) for name in tool_list)
+        a_texts.append(f"{mname} {tools_concat}".strip())
+
+    return q_ids, q_texts, tool_names, a_ids, a_texts, a_tool_lists
+
+
 def build_vectorizers(
     q_texts: List[str],
     tool_texts: List[str],
