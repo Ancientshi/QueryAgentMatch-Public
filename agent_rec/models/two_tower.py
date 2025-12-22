@@ -25,7 +25,6 @@ class TwoTowerTFIDF(RecommenderBase):
         tool_emb: bool = True,
         num_agents: int = 0,
         use_agent_id_emb: bool = False,
-        agent_id_weight: float = 0.5,
         export_batch_size: int = 4096,
     ) -> None:
         super().__init__()
@@ -40,7 +39,6 @@ class TwoTowerTFIDF(RecommenderBase):
             self.emb_tool = None
 
         self.use_agent_id_emb = bool(use_agent_id_emb) and num_agents > 0
-        self.agent_id_weight = float(agent_id_weight)
         if self.use_agent_id_emb:
             self.emb_agent = nn.Embedding(num_agents, hid)
             nn.init.xavier_uniform_(self.emb_agent.weight)
@@ -81,7 +79,7 @@ class TwoTowerTFIDF(RecommenderBase):
         if self.use_tool_emb:
             ah = ah + 0.5 * self.tool_agg(agent_idx)
         if self.use_agent_id_emb:
-            ah = ah + self.agent_id_weight * self.emb_agent(agent_idx)
+            ah = ah + 0.5 * self.emb_agent(agent_idx)
         return F.normalize(ah, dim=-1)
 
     def forward_score(
@@ -132,6 +130,5 @@ class TwoTowerTFIDF(RecommenderBase):
         return {
             "use_tool_emb": self.use_tool_emb,
             "use_agent_id_emb": self.use_agent_id_emb,
-            "agent_id_weight": self.agent_id_weight,
             "export_batch_size": self.export_batch_size,
         }

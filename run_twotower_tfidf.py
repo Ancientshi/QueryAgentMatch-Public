@@ -207,7 +207,6 @@ def main() -> None:
     parser.add_argument("--amp", type=int, default=0, help="1 to enable autocast on CUDA (bfloat16)")
     parser.add_argument("--use_tool_emb", type=int, default=1)
     parser.add_argument("--use_agent_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
-    parser.add_argument("--agent_id_weight", type=float, default=0.5, help="scaling for agent-ID embedding")
     args = parser.parse_args()
 
     if args.topk != EVAL_TOPK:
@@ -311,7 +310,6 @@ def main() -> None:
         tool_emb=bool(args.use_tool_emb),
         num_agents=len(a_ids),
         use_agent_id_emb=bool(args.use_agent_id_emb),
-        agent_id_weight=args.agent_id_weight,
     ).to(device)
 
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
@@ -379,7 +377,6 @@ def main() -> None:
         "flags": {
             "use_tool_emb": bool(args.use_tool_emb),
             "use_agent_id_emb": bool(args.use_agent_id_emb),
-            "agent_id_weight": float(args.agent_id_weight),
         },
         "mappings": {"q_ids": q_ids, "a_ids": a_ids, "tool_names": feature_cache.tool_names},
     }
