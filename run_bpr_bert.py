@@ -147,7 +147,6 @@ def encode_batch(tokenizer, encoder, texts: List[str], device, max_len: int = 12
         vec = out.pooler_output
     return vec
 
-
 class LoRALinear(nn.Module):
     def __init__(self, base_linear: nn.Linear, r: int = 8, alpha: int = 16, dropout: float = 0.0):
         super().__init__()
@@ -156,21 +155,36 @@ class LoRALinear(nn.Module):
         self.r = r
         self.alpha = alpha
         self.scaling = alpha / max(1, r)
+
+        # keep references to frozen base weights
         self.weight = base_linear.weight
         self.bias = base_linear.bias
         for p in (self.weight, self.bias):
             if p is not None:
                 p.requires_grad = False
-        self.A = nn.Parameter(torch.zeros((r, self.in_features)))
-        self.B = nn.Parameter(torch.zeros((self.out_features, r)))
+
+        # ✅ create LoRA params on SAME device/dtype as base weight
+        dev = base_linear.weight.device
+        dt = base_linear.weight.dtype
+        self.A = nn.Parameter(torch.empty((r, self.in_features), device=dev, dtype=dt))
+        self.B = nn.Parameter(torch.empty((self.out_features, r), device=dev, dtype=dt))
+
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
         nn.init.zeros_(self.B)
+
         self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # base: (..., out_features)
         base = F.linear(x, self.weight, self.bias)
-        lora = (self.B @ (self.A @ x.transpose(-2, -1))).transpose(-2, -1)
-        return base + self.dropout(lora) * self.scaling
+
+        # ✅ lora path using F.linear (works for 2D/3D inputs, no transpose, no device mismatch)
+        # x: (..., in_features) -> (..., r) -> (..., out_features)
+        h = F.linear(self.dropout(x), self.A)     # (..., r)
+        lora = F.linear(h, self.B)                # (..., out_features)
+
+        return base + lora * self.scaling
+
 
 
 def apply_lora_to_encoder(encoder: nn.Module, target_keywords: List[str], r: int, alpha: int, dropout: float):
@@ -252,7 +266,7 @@ def main():
     parser.add_argument("--valid_ratio", type=float, default=0.2)
     parser.add_argument("--topk", type=int, default=EVAL_TOPK)
     parser.add_argument("--eval_cand_size", type=int, default=100)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--device", type=str, default="cude:0")
     parser.add_argument("--rebuild_training_cache", type=int, default=0)
     parser.add_argument("--rebuild_embedding_cache", type=int, default=0)
     parser.add_argument("--pooling", type=str, choices=["cls", "mean"], default="cls")
@@ -269,7 +283,7 @@ def main():
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
-    parser.add_argument("--lora_targets", type=str, default="query,key,value,dense")
+    parser.add_argument("--lora_targets", type=str, default="q_lin,k_lin,v_lin,out_lin")
     args = parser.parse_args()
 
     if args.topk != EVAL_TOPK:
@@ -304,6 +318,8 @@ def main():
     agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(
         a_ids, a_tool_lists, tool_names
     )
+    agent_tool_idx_padded = torch.from_numpy(agent_tool_idx_padded).long()
+    agent_tool_mask = torch.from_numpy(agent_tool_mask).float()
 
     qid2idx = {qid: i for i, qid in enumerate(q_ids)}
     aid2idx = {aid: i for i, aid in enumerate(a_ids)}
@@ -379,6 +395,11 @@ def main():
             print(f"[encoder] gradient checkpointing not supported: {exc}")
 
     if args.tune_mode == "lora":
+        # 1) freeze everything first (so we ONLY train LoRA params)
+        for p in encoder.parameters():
+            p.requires_grad = False
+
+        # 2) inject LoRA
         targets = [s.strip().lower() for s in args.lora_targets.split(",") if s.strip()]
         apply_lora_to_encoder(
             encoder,
@@ -388,8 +409,15 @@ def main():
             dropout=args.lora_dropout,
         )
 
-    if args.tune_mode == "full":
+        # 3) sanity: show trainable params
+        trainable = [(n, p.numel()) for n, p in encoder.named_parameters() if p.requires_grad]
+        print(f"[LoRA] trainable encoder params: {len(trainable)} tensors, {sum(x for _, x in trainable):,} params")
+        if len(trainable) <= 20:
+            print("[LoRA] trainable names:", [n for n, _ in trainable])
+
+    elif args.tune_mode == "full":
         set_finetune_scope(encoder, unfreeze_last_n=args.unfreeze_last_n, unfreeze_emb=bool(args.unfreeze_emb))
+
     elif args.tune_mode == "frozen":
         for p in encoder.parameters():
             p.requires_grad = False
@@ -418,8 +446,8 @@ def main():
                 and enc_meta.get("pooling", "cls") == args.pooling
             ):
                 print(f"[cache] loaded transformer embeddings from {transformer_cache_dir}")
-                agent_tool_idx_padded = torch.from_numpy(agent_tool_idx_padded_np)
-                agent_tool_mask = torch.from_numpy(agent_tool_mask_np)
+                agent_tool_idx_padded = torch.from_numpy(agent_tool_idx_padded_np).long()
+                agent_tool_mask = torch.from_numpy(agent_tool_mask_np).float()
             else:
                 print("[cache] transformer cache mismatch; rebuilding embeddings...")
                 Q_emb = A_emb = None
