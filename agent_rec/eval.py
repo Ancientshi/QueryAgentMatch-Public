@@ -223,3 +223,83 @@ def evaluate_sampled_direct_top10(
         agg[m] /= cnt
 
     return {topk: agg}
+
+
+@np.errstate(all="ignore")
+def evaluate_sampled_embedding_topk(
+    model,
+    qid2idx: Dict[str, int],
+    aid2idx: Dict[str, int],
+    all_rankings: Dict[str, List[str]],
+    eval_qids: List[str],
+    Q_t: torch.Tensor,
+    A_t: torch.Tensor,
+    cand_size: int = 100,
+    pos_topk: int = POS_TOPK,
+    topk: int = EVAL_TOPK,
+    seed: int = 123,
+    desc: str = "Evaluating",
+) -> Dict[int, Dict[str, float]]:
+    """Sampled eval using precomputed query/agent embeddings."""
+    device = next(model.parameters()).device
+    Q_t = Q_t.to(device)
+    A_t = A_t.to(device)
+
+    all_agents = list(aid2idx.keys())
+    all_agent_set = set(all_agents)
+
+    agg = {m: 0.0 for m in ["P", "R", "F1", "Hit", "nDCG", "MRR"]}
+    cnt, skipped = 0, 0
+
+    pbar = tqdm(eval_qids, desc=desc, leave=True, dynamic_ncols=True)
+    for qid in pbar:
+        gt = [aid for aid in all_rankings.get(qid, [])[:pos_topk] if aid in aid2idx]
+        if not gt:
+            skipped += 1
+            pbar.set_postfix({"done": cnt, "skipped": skipped})
+            continue
+
+        rel_set = set(gt)
+        neg_pool = list(all_agent_set - rel_set)
+
+        qid_seed = (zlib.crc32(str(qid).encode("utf-8")) ^ (seed * 2654435761)) & 0xFFFFFFFF
+        rnd = random.Random(qid_seed)
+
+        need_neg = max(0, cand_size - len(gt))
+        if need_neg > 0 and neg_pool:
+            k = min(need_neg, len(neg_pool))
+            sampled_negs = rnd.sample(neg_pool, k)
+            cand = gt + sampled_negs
+        else:
+            cand = gt
+
+        qi = qid2idx[qid]
+        qv = Q_t[qi : qi + 1].repeat(len(cand), 1)
+        ai_idx = torch.tensor([aid2idx[a] for a in cand], dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            scores = model.forward_score(qv, A_t[ai_idx], ai_idx).detach().cpu().numpy()
+        order = np.argsort(-scores)[:topk]
+        pred = [cand[i] for i in order]
+
+        met = _metrics_at_k(pred, rel_set, topk)
+        for m in agg:
+            agg[m] += met[m]
+        cnt += 1
+
+        pbar.set_postfix({
+            "done": cnt,
+            "skipped": skipped,
+            f"P@{topk}": f"{(agg['P']/cnt):.4f}",
+            f"nDCG@{topk}": f"{(agg['nDCG']/cnt):.4f}",
+            f"MRR@{topk}": f"{(agg['MRR']/cnt):.4f}",
+            "Ncand": len(cand),
+        })
+
+    if cnt == 0:
+        return {topk: {m: 0.0 for m in agg}}
+
+    for m in agg:
+        agg[m] /= cnt
+
+    return {topk: agg}
