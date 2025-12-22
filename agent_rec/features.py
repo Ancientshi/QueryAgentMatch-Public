@@ -59,6 +59,38 @@ def build_text_corpora(
     return q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists
 
 
+def build_twotower_text_corpora(
+    all_agents: Dict[str, dict],
+    all_questions: Dict[str, dict],
+    tools: Dict[str, dict],
+) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]]]:
+    """Build TF-IDF corpora for two-tower models with tool text appended to agent text."""
+    q_ids = list(all_questions.keys())
+    q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
+
+    tool_names = list(tools.keys())
+
+    def tool_text(name: str) -> str:
+        t = tools.get(name, {}) or {}
+        desc = t.get("description", "")
+        return f"{name} {desc}".strip()
+
+    tool_texts = [tool_text(name) for name in tool_names]
+
+    a_ids = list(all_agents.keys())
+    a_texts: List[str] = []
+    a_tool_lists: List[List[str]] = []
+    for aid in a_ids:
+        a = all_agents.get(aid, {}) or {}
+        mname = ((a.get("M") or {}).get("name") or "").strip()
+        tool_list = ((a.get("T") or {}).get("tools") or [])
+        a_tool_lists.append(tool_list)
+        tools_concat = " ".join(tool_text(name) for name in tool_list)
+        a_texts.append(f"{mname} {tools_concat}".strip())
+
+    return q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists
+
+
 def build_transformer_corpora(
     all_agents: Dict[str, dict],
     all_questions: Dict[str, dict],
@@ -141,6 +173,43 @@ def build_agent_tool_id_buffers(
                 idx_pad[i, j] = t_map[name]
                 mask[i, j] = 1.0
     return idx_pad, mask
+
+
+def build_twotower_feature_cache(
+    all_agents: Dict[str, dict],
+    all_questions: Dict[str, dict],
+    tools: Dict[str, dict],
+    max_features: int = TFIDF_MAX_FEATURES,
+) -> Tuple[FeatureCache, TfidfVectorizer]:
+    (
+        q_ids,
+        q_texts,
+        tool_names,
+        tool_texts,
+        a_ids,
+        a_texts,
+        a_tool_lists,
+    ) = build_twotower_text_corpora(all_agents, all_questions, tools)
+
+    q_vec, tool_vec, a_vec, Q_csr, Tm_csr, Am_csr = build_vectorizers(
+        q_texts, tool_texts, a_texts, max_features
+    )
+
+    Atool = agent_tool_text_matrix(a_tool_lists, tool_names, Tm_csr)
+    Am = Am_csr.toarray().astype(np.float32)
+    A_text_full = np.concatenate([Am, Atool], axis=1).astype(np.float32)
+    Q = Q_csr.toarray().astype(np.float32)
+
+    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
+    return FeatureCache(
+        q_ids=q_ids,
+        a_ids=a_ids,
+        tool_names=tool_names,
+        Q=Q,
+        A_text_full=A_text_full,
+        agent_tool_idx_padded=agent_tool_idx_padded,
+        agent_tool_mask=agent_tool_mask,
+    ), q_vec
 
 
 def build_feature_cache(
