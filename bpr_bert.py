@@ -452,8 +452,10 @@ def main():
                 tool_names,
                 Q_emb,
                 A_emb,
-                agent_tool_idx_padded.numpy(),
-                agent_tool_mask.numpy(),
+                agent_tool_idx_padded.cpu().numpy()
+                if torch.is_tensor(agent_tool_idx_padded)
+                else agent_tool_idx_padded,
+                agent_tool_mask.cpu().numpy() if torch.is_tensor(agent_tool_mask) else agent_tool_mask,
                 enc_meta={
                     "pretrained_model": args.pretrained_model,
                     "max_len": args.max_len,
