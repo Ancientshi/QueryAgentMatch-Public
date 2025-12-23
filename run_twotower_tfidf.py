@@ -28,11 +28,8 @@ from tqdm.auto import tqdm
 
 from agent_rec.config import POS_TOPK, EVAL_TOPK, TFIDF_MAX_FEATURES
 from agent_rec.data import (
-    collect_data,
     dataset_signature,
     ensure_cache_dir,
-    load_tools,
-    qids_with_rankings,
     stratified_train_valid_split,
 )
 from agent_rec.features import (
@@ -45,6 +42,15 @@ from agent_rec.features import (
 )
 from agent_rec.eval import split_eval_qids_by_part
 from agent_rec.models.two_tower import TwoTowerTFIDF
+from agent_rec.run_common import (
+    build_id_maps,
+    load_data_bundle,
+    load_or_build_training_cache,
+    qids_with_rankings_and_log,
+    set_global_seed,
+    summarize_bundle,
+    warn_if_topk_diff,
+)
 
 from utils import print_metrics_table
 
@@ -68,19 +74,6 @@ def build_pos_pairs(
             pairs.append((qid, pos_a))
     rnd.shuffle(pairs)
     return pairs
-
-
-def training_cache_paths(cache_dir: str) -> Tuple[str, str, str, str]:
-    return (
-        os.path.join(cache_dir, "train_qids.json"),
-        os.path.join(cache_dir, "valid_qids.json"),
-        os.path.join(cache_dir, "pairs_train.npy"),
-        os.path.join(cache_dir, "train_cache_meta.json"),
-    )
-
-
-def training_cache_exists(cache_dir: str) -> bool:
-    return all(os.path.exists(p) for p in training_cache_paths(cache_dir))
 
 
 @torch.no_grad()
@@ -210,32 +203,20 @@ def main() -> None:
     parser.add_argument("--use_agent_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
     args = parser.parse_args()
 
-    if args.topk != EVAL_TOPK:
-        print(f"[warn] You set --topk={args.topk}, but protocol suggests fixed top10. Proceeding.")
+    warn_if_topk_diff(args.topk)
 
-    random.seed(1234)
-    np.random.seed(1234)
-    torch.manual_seed(1234)
+    set_global_seed(1234)
 
-    bundle = collect_data(args.data_root, parts=["PartI", "PartII", "PartIII"])
+    bundle, tools = load_data_bundle(args.data_root, with_tools=True)
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings
     qid_to_part = bundle.qid_to_part
 
-    tools = load_tools(args.data_root)
-    print(
-        f"Loaded {len(all_agents)} agents, {len(all_questions)} questions, "
-        f"{len(all_rankings)} ranked entries, {len(tools)} tools."
-    )
+    summarize_bundle(bundle, tools)
 
-    q_ids = list(all_questions.keys())
-    a_ids = list(all_agents.keys())
-    qid2idx = {qid: i for i, qid in enumerate(q_ids)}
-    aid2idx = {aid: i for i, aid in enumerate(a_ids)}
-
-    qids_in_rank = qids_with_rankings(q_ids, all_rankings)
-    print(f"Questions with rankings: {len(qids_in_rank)} / {len(q_ids)}")
+    q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
+    qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
 
     cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
 
@@ -270,36 +251,21 @@ def main() -> None:
         "pair_type": "q_pos_only_posTopK",
     }
 
-    use_cache = training_cache_exists(cache_dir) and (args.rebuild_training_cache == 0)
-    if use_cache:
-        train_qids_path, valid_qids_path, pairs_path, meta_path = training_cache_paths(cache_dir)
-        with open(train_qids_path, "r", encoding="utf-8") as f:
-            train_qids = json.load(f)
-        with open(valid_qids_path, "r", encoding="utf-8") as f:
-            valid_qids = json.load(f)
-        pairs_idx_np = np.load(pairs_path)
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if meta != want_meta:
-            use_cache = False
-
-    if not use_cache:
+    def build_cache():
         train_qids, valid_qids = stratified_train_valid_split(
             qids_in_rank, qid_to_part=bundle.qid_to_part, valid_ratio=args.valid_ratio, seed=args.split_seed
         )
         pairs = build_pos_pairs({qid: all_rankings[qid] for qid in train_qids}, rng_seed=args.rng_seed_pairs)
         pairs_idx = [(qid2idx[q], aid2idx[a]) for (q, a) in pairs]
         pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
+        return train_qids, valid_qids, pairs_idx_np
 
-        train_qids_path, valid_qids_path, pairs_path, meta_path = training_cache_paths(cache_dir)
-        with open(train_qids_path, "w", encoding="utf-8") as f:
-            json.dump(train_qids, f, ensure_ascii=False)
-        with open(valid_qids_path, "w", encoding="utf-8") as f:
-            json.dump(valid_qids, f, ensure_ascii=False)
-        np.save(pairs_path, pairs_idx_np)
-        with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump(want_meta, f, ensure_ascii=False, sort_keys=True)
-        print(f"[cache] saved train/valid/pairs to {cache_dir}")
+    train_qids, valid_qids, pairs_idx_np = load_or_build_training_cache(
+        cache_dir,
+        args.rebuild_training_cache,
+        want_meta,
+        build_cache,
+    )
 
     device = torch.device(args.device)
     encoder = TwoTowerTFIDF(
