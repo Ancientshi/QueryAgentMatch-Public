@@ -408,7 +408,7 @@ def main() -> None:
             amp=use_amp,
         )
         print_metrics_table(
-            f"Validation {part} (averaged over questions)", m_part, ks=(topk,), filename="two_tower"
+            f"Validation {part} (averaged over questions)", m_part, ks=(topk,), filename=args.exp_name
         )
 
     @torch.no_grad()

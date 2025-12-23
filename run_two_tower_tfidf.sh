@@ -12,5 +12,5 @@ python run_twotower_tfidf.py \
   --device cuda:1 \
   --eval_chunk 8192 \
   --use_tool_emb 1 \
-  --use_agent_id_emb 1 \
-  --exp_name two_tower_tfidf_toolid_agentid \
+  --use_agent_id_emb 0 \
+  --exp_name two_tower_tfidf_toolid \
