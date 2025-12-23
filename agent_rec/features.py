@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 from dataclasses import dataclass
+import os
+import tempfile
+import uuid
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
+from numpy.lib.format import open_memmap
 
 try:
     from scipy import sparse as sp
@@ -316,6 +320,171 @@ def feature_cache_exists(cache_dir: str) -> bool:
         "agent_tool_mask.npy",
     ]
     return all(os.path.exists(f"{cache_dir}/{name}") for name in needed)
+
+
+def to_2d_float32(x: np.ndarray | list | tuple) -> np.ndarray:
+    if isinstance(x, tuple) and len(x) == 3:
+        arr, inv_order, _ = x
+        x = arr if inv_order is None else arr[inv_order, :]
+    x = np.asarray(x)
+    if x.dtype == np.object_ or x.ndim != 2:
+        try:
+            x = np.vstack([np.asarray(row, dtype=np.float32) for row in x])
+        except Exception as e:
+            raise ValueError(
+                f"Embedding batch is ragged or non-2D: {type(x)}, shape={getattr(x, 'shape', None)}"
+            ) from e
+    return x.astype(np.float32, copy=False)
+
+
+def l2_normalize(mat: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    mat = to_2d_float32(mat)
+    n = np.linalg.norm(mat, axis=1, keepdims=True)
+    n = np.maximum(n, eps)
+    return mat / n
+
+
+def _post_embed(embed_url: str, docs: List[str]) -> np.ndarray:
+    if embed_url and embed_url.startswith("http"):
+        import requests
+
+        response = requests.post(embed_url, json={"documents": docs}, timeout=120)
+        response.raise_for_status()
+        payload = response.json()
+        if "embeddings" not in payload:
+            raise ValueError("Embedding service response missing `embeddings` field.")
+        return np.asarray(payload["embeddings"], dtype=np.float32)
+
+    from utils import load_BGEM3_model, get_embeddings
+
+    load_BGEM3_model()
+    embs = get_embeddings(docs)
+    return np.asarray(embs, dtype=np.float32)
+
+
+def batch_embed(
+    texts: List[str],
+    embed_url: str,
+    batch_size: int = 64,
+    desc: str = "Embedding",
+    *,
+    use_memmap: bool = True,
+    memmap_path: str | None = None,
+    return_mode: str = "array",
+    sort_by_length: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray, str]:
+    num_texts = len(texts)
+    if num_texts == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    order = np.arange(num_texts)
+    if sort_by_length:
+        order = np.argsort([len(t) for t in texts])
+    inv_order = np.empty_like(order)
+    inv_order[order] = np.arange(num_texts)
+    texts_sorted = [texts[i] for i in order]
+
+    out = None
+    mm = None
+    dim = None
+
+    for start in range(0, num_texts, batch_size):
+        end = min(start + batch_size, num_texts)
+        chunk = texts_sorted[start:end]
+        embs = _post_embed(embed_url, chunk)
+        if dim is None:
+            dim = int(embs.shape[1])
+            if use_memmap:
+                if memmap_path is None:
+                    memmap_path = os.path.join(tempfile.gettempdir(), f"emb_{uuid.uuid4().hex}.npy")
+                mm = open_memmap(memmap_path, mode="w+", dtype=np.float32, shape=(num_texts, dim))
+            else:
+                out = np.empty((num_texts, dim), dtype=np.float32)
+
+        if embs.shape[1] != dim:
+            raise ValueError(f"Embedding dim changed: got {embs.shape[1]} vs {dim}")
+
+        target = mm if use_memmap else out
+        target[start:end, :] = embs
+
+    if use_memmap:
+        mm.flush()
+        view = np.load(memmap_path, mmap_mode="r")
+        if sort_by_length:
+            view = view[inv_order, :]
+        if return_mode == "mmap":
+            return view, inv_order, memmap_path
+        return np.array(view, copy=True)
+
+    return out if not sort_by_length else out[inv_order, :]
+
+
+def agent_tool_text_matrix_bge(
+    agent_tool_lists: List[List[str]],
+    tool_names: List[str],
+    tool_embs: np.ndarray,
+) -> np.ndarray:
+    name2idx = {n: i for i, n in enumerate(tool_names)}
+    dim = tool_embs.shape[1]
+    num_agents = len(agent_tool_lists)
+    out = np.zeros((num_agents, dim), dtype=np.float32)
+    for i, tool_list in enumerate(agent_tool_lists):
+        idxs = [name2idx[t] for t in tool_list if t in name2idx]
+        if not idxs:
+            continue
+        vecs = tool_embs[idxs]
+        out[i] = vecs.mean(axis=0).astype(np.float32)
+    return out
+
+
+def build_twotower_bge_feature_cache(
+    all_agents: Dict[str, dict],
+    all_questions: Dict[str, dict],
+    tools: Dict[str, dict],
+    *,
+    embed_url: str,
+    embed_batch: int = 64,
+    use_memmap: bool = True,
+    sort_by_length: bool = False,
+) -> FeatureCache:
+    (
+        q_ids,
+        q_texts,
+        tool_names,
+        tool_texts,
+        a_ids,
+        a_texts,
+        a_tool_lists,
+    ) = build_twotower_text_corpora(all_agents, all_questions, tools)
+
+    Q = batch_embed(q_texts, embed_url, embed_batch, desc="Embedding questions", use_memmap=use_memmap)
+    Q = l2_normalize(Q)
+
+    ToolE = batch_embed(tool_texts, embed_url, embed_batch, desc="Embedding tools", use_memmap=use_memmap)
+    ToolE = l2_normalize(ToolE)
+
+    A_text_emb = batch_embed(
+        a_texts, embed_url, embed_batch, desc="Embedding agents (text)", use_memmap=use_memmap
+    )
+    A_text_emb = l2_normalize(A_text_emb)
+
+    A_tool_emb = agent_tool_text_matrix_bge(a_tool_lists, tool_names, ToolE)
+    if A_tool_emb.size > 0:
+        A_tool_emb = l2_normalize(A_tool_emb)
+
+    A_text_full = np.concatenate([A_text_emb, A_tool_emb], axis=1).astype(np.float32)
+
+    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
+
+    return FeatureCache(
+        q_ids=q_ids,
+        a_ids=a_ids,
+        tool_names=tool_names,
+        Q=Q.astype(np.float32),
+        A_text_full=A_text_full.astype(np.float32),
+        agent_tool_idx_padded=agent_tool_idx_padded,
+        agent_tool_mask=agent_tool_mask,
+    )
 
 
 def normalize_features(user_np: np.ndarray, item_np: np.ndarray) -> Tuple["sp.csr_matrix", "sp.csr_matrix"]:
