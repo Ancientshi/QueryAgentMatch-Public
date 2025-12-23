@@ -24,9 +24,11 @@ from agent_rec.eval import evaluate_sampled_knn_top10, split_eval_qids_by_part
 from agent_rec.models.bpr_mf import BPRMF, bpr_loss
 from agent_rec.run_common import (
     build_id_maps,
+    cache_key_from_meta,
     load_data_bundle,
     load_or_build_training_cache,
     qids_with_rankings_and_log,
+    shared_cache_dir,
     set_global_seed,
     summarize_bundle,
     warn_if_topk_diff,
@@ -71,16 +73,18 @@ def main():
     q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
     qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
 
-    cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
+    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
 
     want_meta = {
-        "data_sig": dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank}),
+        "data_sig": data_sig,
         "pos_topk": int(POS_TOPK),
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
         "valid_ratio": float(args.valid_ratio),
     }
+    training_cache_dir = shared_cache_dir(args.data_root, "training", f"{data_sig}_{cache_key_from_meta(want_meta)}")
 
     def build_cache():
         train_qids, valid_qids = stratified_train_valid_split(
@@ -97,7 +101,7 @@ def main():
         return train_qids, valid_qids, pairs_idx_np
 
     train_qids, valid_qids, pairs_idx_np = load_or_build_training_cache(
-        cache_dir,
+        training_cache_dir,
         args.rebuild_training_cache,
         want_meta,
         build_cache,
@@ -137,7 +141,7 @@ def main():
 
         print(f"Epoch {epoch}/{args.epochs} - BPR loss: {(total_loss / num_batches if num_batches else 0.0):.4f}")
 
-    model_dir = os.path.join(cache_dir, "models")
+    model_dir = os.path.join(exp_cache_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
     data_sig = want_meta["data_sig"]
 
@@ -159,7 +163,7 @@ def main():
     print(f"[save] model -> {ckpt_path}")
     print(f"[save] meta  -> {meta_path}")
 
-    knn_path = os.path.join(cache_dir, "knn_copy.pkl")
+    knn_path = os.path.join(exp_cache_dir, "knn_copy.pkl")
     build_knn_cache(
         train_qids=train_qids,
         all_questions=all_questions,

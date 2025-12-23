@@ -1,6 +1,7 @@
 import json
 import os
 import random
+import zlib
 from typing import Callable, Iterable, Tuple
 
 import numpy as np
@@ -68,6 +69,29 @@ def training_cache_paths(cache_dir: str) -> Tuple[str, str, str, str]:
         os.path.join(cache_dir, "pairs_train.npy"),
         os.path.join(cache_dir, "train_cache_meta.json"),
     )
+
+
+def shared_cache_root(data_root: str) -> str:
+    root = os.path.join(data_root, ".cache", "shared")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def shared_cache_dir(data_root: str, *parts: str) -> str:
+    root = shared_cache_root(data_root)
+    d = os.path.join(root, *parts)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def cache_key_from_meta(meta: dict) -> str:
+    payload = json.dumps(meta, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return f"{(zlib.crc32(payload) & 0xFFFFFFFF):08x}"
+
+
+def cache_key_from_text(text: str) -> str:
+    payload = text.encode("utf-8")
+    return f"{(zlib.crc32(payload) & 0xFFFFFFFF):08x}"
 
 
 def load_or_build_training_cache(

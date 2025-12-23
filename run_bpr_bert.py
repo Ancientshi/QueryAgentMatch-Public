@@ -26,9 +26,12 @@ from agent_rec.eval import evaluate_sampled_embedding_topk, split_eval_qids_by_p
 from agent_rec.features import build_agent_tool_id_buffers, build_transformer_corpora
 from agent_rec.models.dnn import SimpleBPRDNN, bpr_loss
 from agent_rec.run_common import (
+    cache_key_from_meta,
+    cache_key_from_text,
     load_data_bundle,
     load_or_build_training_cache,
     qids_with_rankings_and_log,
+    shared_cache_dir,
     set_global_seed,
     summarize_bundle,
     warn_if_topk_diff,
@@ -322,17 +325,22 @@ def main():
     aid2idx = {aid: i for i, aid in enumerate(a_ids)}
     qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
 
-    cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
-    transformer_cache_dir = ensure_transformer_cache_dir(cache_dir)
+    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
+    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    transformer_cache_key = f"{data_sig}_{cache_key_from_text(args.pretrained_model)}"
+    transformer_cache_dir = ensure_transformer_cache_dir(
+        shared_cache_dir(args.data_root, "transformer", transformer_cache_key)
+    )
 
     want_meta = {
-        "data_sig": dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank}),
+        "data_sig": data_sig,
         "pos_topk": int(POS_TOPK),
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
         "valid_ratio": float(args.valid_ratio),
     }
+    training_cache_dir = shared_cache_dir(args.data_root, "training", f"{data_sig}_{cache_key_from_meta(want_meta)}")
 
     def build_cache():
         train_qids, valid_qids = stratified_train_valid_split(
@@ -349,7 +357,7 @@ def main():
         return train_qids, valid_qids, pairs_idx_np
 
     train_qids, valid_qids, pairs_idx_np = load_or_build_training_cache(
-        cache_dir,
+        training_cache_dir,
         args.rebuild_training_cache,
         want_meta,
         build_cache,
@@ -588,9 +596,8 @@ def main():
         Q_t = torch.from_numpy(Q_emb_eval).to(device)
         A_t = torch.from_numpy(A_emb_eval).to(device)
 
-    model_dir = os.path.join(cache_dir, "models")
+    model_dir = os.path.join(exp_cache_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
-    data_sig = want_meta["data_sig"]
 
     ckpt_path = os.path.join(model_dir, f"{args.exp_name}_{data_sig}.pt")
     meta_path = os.path.join(model_dir, f"meta_{args.exp_name}_{data_sig}.json")

@@ -44,9 +44,11 @@ from agent_rec.eval import split_eval_qids_by_part
 from agent_rec.models.two_tower import TwoTowerTFIDF
 from agent_rec.run_common import (
     build_id_maps,
+    cache_key_from_meta,
     load_data_bundle,
     load_or_build_training_cache,
     qids_with_rankings_and_log,
+    shared_cache_dir,
     set_global_seed,
     summarize_bundle,
     warn_if_topk_diff,
@@ -218,24 +220,30 @@ def main() -> None:
     q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
     qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
 
-    cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
+    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    feature_cache_dir = shared_cache_dir(
+        args.data_root,
+        "features",
+        f"twotower_tfidf_{args.max_features}_{data_sig}",
+    )
 
-    if feature_cache_exists(cache_dir) and args.rebuild_feature_cache == 0:
-        feature_cache = load_feature_cache(cache_dir)
-        q_vectorizer_runtime = load_q_vectorizer(cache_dir)
+    if feature_cache_exists(feature_cache_dir) and args.rebuild_feature_cache == 0:
+        feature_cache = load_feature_cache(feature_cache_dir)
+        q_vectorizer_runtime = load_q_vectorizer(feature_cache_dir)
         if q_vectorizer_runtime is None:
             feature_cache, q_vectorizer_runtime = build_twotower_feature_cache(
                 all_agents, all_questions, tools, max_features=args.max_features
             )
-            save_feature_cache(cache_dir, feature_cache)
-            save_q_vectorizer(cache_dir, q_vectorizer_runtime)
+            save_feature_cache(feature_cache_dir, feature_cache)
+            save_q_vectorizer(feature_cache_dir, q_vectorizer_runtime)
     else:
         feature_cache, q_vectorizer_runtime = build_twotower_feature_cache(
             all_agents, all_questions, tools, max_features=args.max_features
         )
-        save_feature_cache(cache_dir, feature_cache)
-        save_q_vectorizer(cache_dir, q_vectorizer_runtime)
-        print(f"[cache] saved features to {cache_dir}")
+        save_feature_cache(feature_cache_dir, feature_cache)
+        save_q_vectorizer(feature_cache_dir, q_vectorizer_runtime)
+        print(f"[cache] saved features to {feature_cache_dir}")
 
     Q_cpu = feature_cache.Q.astype(np.float32)
     A_cpu = feature_cache.A_text_full.astype(np.float32)
@@ -243,13 +251,14 @@ def main() -> None:
     tool_mask_np = feature_cache.agent_tool_mask
 
     want_meta = {
-        "data_sig": dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank}),
+        "data_sig": data_sig,
         "pos_topk": int(POS_TOPK),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
         "valid_ratio": float(args.valid_ratio),
         "pair_type": "q_pos_only_posTopK",
     }
+    training_cache_dir = shared_cache_dir(args.data_root, "training", f"{data_sig}_{cache_key_from_meta(want_meta)}")
 
     def build_cache():
         train_qids, valid_qids = stratified_train_valid_split(
@@ -261,7 +270,7 @@ def main() -> None:
         return train_qids, valid_qids, pairs_idx_np
 
     train_qids, valid_qids, pairs_idx_np = load_or_build_training_cache(
-        cache_dir,
+        training_cache_dir,
         args.rebuild_training_cache,
         want_meta,
         build_cache,
@@ -323,7 +332,7 @@ def main() -> None:
 
         print(f"Epoch {epoch}/{args.epochs} - InfoNCE: {(total / max(1, num_batches)):.4f}")
 
-    model_dir = os.path.join(cache_dir, "models")
+    model_dir = os.path.join(exp_cache_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
     data_sig = want_meta["data_sig"]
     model_path = os.path.join(model_dir, f"two_tower_tfidf_{data_sig}.pt")

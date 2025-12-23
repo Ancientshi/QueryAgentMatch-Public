@@ -32,9 +32,11 @@ from agent_rec.eval import evaluate_sampled_direct_top10, split_eval_qids_by_par
 from agent_rec.models.dnn import SimpleBPRDNN, bpr_loss
 from agent_rec.run_common import (
     build_id_maps,
+    cache_key_from_meta,
     load_data_bundle,
     load_or_build_training_cache,
     qids_with_rankings_and_log,
+    shared_cache_dir,
     set_global_seed,
     summarize_bundle,
     warn_if_topk_diff,
@@ -81,11 +83,17 @@ def main():
     q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
     qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
 
-    cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
+    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    feature_cache_dir = shared_cache_dir(
+        args.data_root,
+        "features",
+        f"tfidf_{args.max_features}_{data_sig}",
+    )
 
-    if feature_cache_exists(cache_dir) and args.rebuild_feature_cache == 0:
-        feature_cache = load_feature_cache(cache_dir)
-        q_vectorizer_runtime = load_q_vectorizer(cache_dir)
+    if feature_cache_exists(feature_cache_dir) and args.rebuild_feature_cache == 0:
+        feature_cache = load_feature_cache(feature_cache_dir)
+        q_vectorizer_runtime = load_q_vectorizer(feature_cache_dir)
         if q_vectorizer_runtime is None:
             _, q_texts, _, _, _, _, _ = build_text_corpora(all_agents, all_questions, tools)
             from sklearn.feature_extraction.text import TfidfVectorizer
@@ -93,14 +101,14 @@ def main():
             q_vectorizer_runtime = TfidfVectorizer(
                 max_features=args.max_features, lowercase=True
             ).fit(q_texts)
-            save_q_vectorizer(cache_dir, q_vectorizer_runtime)
+            save_q_vectorizer(feature_cache_dir, q_vectorizer_runtime)
     else:
         feature_cache, q_vectorizer_runtime = build_feature_cache(
             all_agents, all_questions, tools, max_features=args.max_features
         )
-        save_feature_cache(cache_dir, feature_cache)
-        save_q_vectorizer(cache_dir, q_vectorizer_runtime)
-        print(f"[cache] saved features to {cache_dir}")
+        save_feature_cache(feature_cache_dir, feature_cache)
+        save_q_vectorizer(feature_cache_dir, q_vectorizer_runtime)
+        print(f"[cache] saved features to {feature_cache_dir}")
 
     Q_np = feature_cache.Q.astype(np.float32)
     A_text_full_np = feature_cache.A_text_full.astype(np.float32)
@@ -108,13 +116,14 @@ def main():
     tool_mask_np = feature_cache.agent_tool_mask
 
     want_meta = {
-        "data_sig": dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank}),
+        "data_sig": data_sig,
         "pos_topk": int(POS_TOPK),
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
         "valid_ratio": float(args.valid_ratio),
     }
+    training_cache_dir = shared_cache_dir(args.data_root, "training", f"{data_sig}_{cache_key_from_meta(want_meta)}")
 
     def build_cache():
         train_qids, valid_qids = stratified_train_valid_split(
@@ -131,7 +140,7 @@ def main():
         return train_qids, valid_qids, pairs_idx_np
 
     train_qids, valid_qids, pairs_idx_np = load_or_build_training_cache(
-        cache_dir,
+        training_cache_dir,
         args.rebuild_training_cache,
         want_meta,
         build_cache,
@@ -187,7 +196,7 @@ def main():
 
         print(f"Epoch {epoch}/{args.epochs} - BPR loss: {(total_loss / num_batches if num_batches else 0.0):.4f}")
 
-    model_dir = os.path.join(cache_dir, "models")
+    model_dir = os.path.join(exp_cache_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
     data_sig = want_meta["data_sig"]
 
