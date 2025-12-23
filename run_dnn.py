@@ -14,13 +14,10 @@ from tqdm.auto import tqdm
 
 from agent_rec.config import POS_TOPK, EVAL_TOPK, TFIDF_MAX_FEATURES
 from agent_rec.data import (
-    collect_data,
     ensure_cache_dir,
     dataset_signature,
-    qids_with_rankings,
     stratified_train_valid_split,
     build_training_pairs,
-    load_tools,
 )
 from agent_rec.features import (
     build_feature_cache,
@@ -33,6 +30,17 @@ from agent_rec.features import (
 )
 from agent_rec.eval import evaluate_sampled_direct_top10, split_eval_qids_by_part
 from agent_rec.models.dnn import SimpleBPRDNN, bpr_loss
+from agent_rec.run_common import (
+    build_id_maps,
+    cache_key_from_meta,
+    load_data_bundle,
+    load_or_build_training_cache,
+    qids_with_rankings_and_log,
+    shared_cache_dir,
+    set_global_seed,
+    summarize_bundle,
+    warn_if_topk_diff,
+)
 
 from utils import print_metrics_table  # 依赖你现有 utils.py
 
@@ -58,40 +66,34 @@ def main():
     parser.add_argument("--topk", type=int, default=EVAL_TOPK, help="Fixed to 10 by default")
 
     args = parser.parse_args()
-    if args.topk != EVAL_TOPK:
-        print(f"[warn] You set --topk={args.topk}, but protocol suggests fixed top10. Proceeding.")
+    warn_if_topk_diff(args.topk)
 
-    random.seed(1234)
-    np.random.seed(1234)
-    torch.manual_seed(1234)
+    set_global_seed(1234)
 
-    bundle = collect_data(args.data_root, parts=["PartI", "PartII", "PartIII"])
+    bundle, tools = load_data_bundle(args.data_root, with_tools=True)
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings
     qid_to_part = bundle.qid_to_part
 
-    tools = load_tools(args.data_root)
     tool_names = list(tools.keys())
 
-    print(
-        f"Loaded {len(all_agents)} agents, {len(all_questions)} questions, "
-        f"{len(all_rankings)} ranked entries, {len(tools)} tools."
+    summarize_bundle(bundle, tools)
+
+    q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
+    qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
+
+    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
+    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    feature_cache_dir = shared_cache_dir(
+        args.data_root,
+        "features",
+        f"tfidf_{args.max_features}_{data_sig}",
     )
 
-    q_ids = list(all_questions.keys())
-    a_ids = list(all_agents.keys())
-    qid2idx = {qid: i for i, qid in enumerate(q_ids)}
-    aid2idx = {aid: i for i, aid in enumerate(a_ids)}
-
-    qids_in_rank = qids_with_rankings(q_ids, all_rankings)
-    print(f"Questions with rankings: {len(qids_in_rank)} / {len(q_ids)}")
-
-    cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
-
-    if feature_cache_exists(cache_dir) and args.rebuild_feature_cache == 0:
-        feature_cache = load_feature_cache(cache_dir)
-        q_vectorizer_runtime = load_q_vectorizer(cache_dir)
+    if feature_cache_exists(feature_cache_dir) and args.rebuild_feature_cache == 0:
+        feature_cache = load_feature_cache(feature_cache_dir)
+        q_vectorizer_runtime = load_q_vectorizer(feature_cache_dir)
         if q_vectorizer_runtime is None:
             _, q_texts, _, _, _, _, _ = build_text_corpora(all_agents, all_questions, tools)
             from sklearn.feature_extraction.text import TfidfVectorizer
@@ -99,50 +101,31 @@ def main():
             q_vectorizer_runtime = TfidfVectorizer(
                 max_features=args.max_features, lowercase=True
             ).fit(q_texts)
-            save_q_vectorizer(cache_dir, q_vectorizer_runtime)
+            save_q_vectorizer(feature_cache_dir, q_vectorizer_runtime)
     else:
         feature_cache, q_vectorizer_runtime = build_feature_cache(
             all_agents, all_questions, tools, max_features=args.max_features
         )
-        save_feature_cache(cache_dir, feature_cache)
-        save_q_vectorizer(cache_dir, q_vectorizer_runtime)
-        print(f"[cache] saved features to {cache_dir}")
+        save_feature_cache(feature_cache_dir, feature_cache)
+        save_q_vectorizer(feature_cache_dir, q_vectorizer_runtime)
+        print(f"[cache] saved features to {feature_cache_dir}")
 
     Q_np = feature_cache.Q.astype(np.float32)
     A_text_full_np = feature_cache.A_text_full.astype(np.float32)
     tool_ids_np = feature_cache.agent_tool_idx_padded
     tool_mask_np = feature_cache.agent_tool_mask
 
-    split_paths = (
-        os.path.join(cache_dir, "train_qids.json"),
-        os.path.join(cache_dir, "valid_qids.json"),
-        os.path.join(cache_dir, "pairs_train.npy"),
-        os.path.join(cache_dir, "train_cache_meta.json"),
-    )
-
     want_meta = {
-        "data_sig": dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank}),
+        "data_sig": data_sig,
         "pos_topk": int(POS_TOPK),
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
         "valid_ratio": float(args.valid_ratio),
     }
+    training_cache_dir = shared_cache_dir(args.data_root, "training", f"{data_sig}_{cache_key_from_meta(want_meta)}")
 
-    use_cache = all(os.path.exists(p) for p in split_paths) and (args.rebuild_training_cache == 0)
-    if use_cache:
-        with open(split_paths[0], "r", encoding="utf-8") as f:
-            train_qids = json.load(f)
-        with open(split_paths[1], "r", encoding="utf-8") as f:
-            valid_qids = json.load(f)
-        pairs_idx_np = np.load(split_paths[2])
-        with open(split_paths[3], "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if meta != want_meta:
-            print("[cache] training cache meta mismatch, rebuilding...")
-            use_cache = False
-
-    if not use_cache:
+    def build_cache():
         train_qids, valid_qids = stratified_train_valid_split(
             qids_in_rank, qid_to_part=qid_to_part, valid_ratio=args.valid_ratio, seed=args.split_seed
         )
@@ -154,16 +137,14 @@ def main():
         )
         pairs_idx = [(qid2idx[q], aid2idx[p], aid2idx[n]) for (q, p, n) in pairs]
         pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
+        return train_qids, valid_qids, pairs_idx_np
 
-        with open(split_paths[0], "w", encoding="utf-8") as f:
-            json.dump(train_qids, f, ensure_ascii=False)
-        with open(split_paths[1], "w", encoding="utf-8") as f:
-            json.dump(valid_qids, f, ensure_ascii=False)
-        np.save(split_paths[2], pairs_idx_np)
-        with open(split_paths[3], "w", encoding="utf-8") as f:
-            json.dump(want_meta, f, ensure_ascii=False, sort_keys=True)
-
-        print(f"[cache] saved train/valid/pairs to {cache_dir}")
+    train_qids, valid_qids, pairs_idx_np = load_or_build_training_cache(
+        training_cache_dir,
+        args.rebuild_training_cache,
+        want_meta,
+        build_cache,
+    )
 
     device = torch.device(args.device)
     model = SimpleBPRDNN(
@@ -215,7 +196,7 @@ def main():
 
         print(f"Epoch {epoch}/{args.epochs} - BPR loss: {(total_loss / num_batches if num_batches else 0.0):.4f}")
 
-    model_dir = os.path.join(cache_dir, "models")
+    model_dir = os.path.join(exp_cache_dir, "models")
     os.makedirs(model_dir, exist_ok=True)
     data_sig = want_meta["data_sig"]
 
