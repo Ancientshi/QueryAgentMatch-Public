@@ -94,7 +94,7 @@ def evaluate_sampled_twotower(
     eval_qids: List[str],
     device: torch.device,
     ks: Tuple[int, ...] = (5, 10, 50),
-    cand_size: int = 1000,
+    cand_size: int = 100,
     rng_seed: int = 123,
     amp: bool = False,
 ) -> Dict[int, Dict[str, float]]:
@@ -405,12 +405,12 @@ def main() -> None:
         valid_qids,
         device=device,
         ks=(topk,),
-        cand_size=1000,
+        cand_size=100,
         rng_seed=123,
         amp=use_amp,
     )
     print_metrics_table(
-        "Validation Overall (averaged over questions)", valid_metrics, ks=(topk,), filename="two_tower"
+        "Validation Overall (averaged over questions)", valid_metrics, ks=(topk,), filename=args.exp_name
     )
 
     part_splits = split_eval_qids_by_part(valid_qids, qid_to_part=qid_to_part)
@@ -428,7 +428,7 @@ def main() -> None:
             qids_part,
             device=device,
             ks=(topk,),
-            cand_size=1000,
+            cand_size=100,
             rng_seed=123,
             amp=use_amp,
         )
