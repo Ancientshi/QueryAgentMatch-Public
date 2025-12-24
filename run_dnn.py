@@ -42,8 +42,7 @@ from agent_rec.run_common import (
     warn_if_topk_diff,
 )
 
-from utils import print_metrics_table  # 依赖你现有 utils.py
-
+from utils import print_metrics_table  
 
 def main():
     parser = argparse.ArgumentParser()

@@ -9,4 +9,4 @@ python run_twotower_bge.py \
   --device cuda:0 \
   --embed_url http://127.0.0.1:8502/get_embedding \
   --embed_batch 64 \
-  --use_tool_emb 1
+  --use_tool_emb 0
