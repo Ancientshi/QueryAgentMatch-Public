@@ -2,6 +2,11 @@
 set -euo pipefail
 
 # Cross-model defaults. Override via environment variables when launching a script.
+# Track whether callers explicitly set key knobs so model scripts can decide
+# whether to substitute their own tuned defaults.
+USER_SET_EPOCHS="${EPOCHS+1}"
+USER_SET_BATCH_SIZE="${BATCH_SIZE+1}"
+
 DATA_ROOT="${DATA_ROOT:-/path/to/dataset_root}"
 DEVICE="${DEVICE:-cuda:0}"
 EPOCHS="${EPOCHS:-5}"
