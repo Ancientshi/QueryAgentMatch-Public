@@ -16,25 +16,16 @@ from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from agent_rec.config import EVAL_TOPK, POS_TOPK
-from agent_rec.data import (
-    dataset_signature,
-    ensure_cache_dir,
-    stratified_train_valid_split,
-    build_training_pairs,
-)
+from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.eval import evaluate_sampled_embedding_topk, split_eval_qids_by_part
 from agent_rec.features import build_agent_tool_id_buffers, build_transformer_corpora
 from agent_rec.models.dnn import SimpleBPRDNN, bpr_loss
 from agent_rec.run_common import (
     cache_key_from_meta,
     cache_key_from_text,
-    load_data_bundle,
+    bootstrap_run,
     load_or_build_training_cache,
-    qids_with_rankings_and_log,
     shared_cache_dir,
-    set_global_seed,
-    summarize_bundle,
-    warn_if_topk_diff,
 )
 
 from utils import print_metrics_table
@@ -294,17 +285,20 @@ def main():
     parser.add_argument("--lora_targets", type=str, default="q_lin,k_lin,v_lin,out_lin")
     args = parser.parse_args()
 
-    warn_if_topk_diff(args.topk)
+    boot = bootstrap_run(
+        data_root=args.data_root,
+        exp_name=args.exp_name,
+        topk=args.topk,
+        seed=1234,
+        with_tools=True,
+    )
 
-    set_global_seed(1234)
-
-    bundle, tools = load_data_bundle(args.data_root, with_tools=True)
+    bundle = boot.bundle
+    tools = boot.tools
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings
     qid_to_part = bundle.qid_to_part
-
-    summarize_bundle(bundle, tools)
 
     (
         q_ids,
@@ -314,6 +308,8 @@ def main():
         a_texts,
         a_tool_lists,
     ) = build_transformer_corpora(all_agents, all_questions, tools)
+    if q_ids != boot.q_ids or a_ids != boot.a_ids:
+        raise ValueError("ID ordering mismatch between data bootstrap and transformer corpora.")
 
     agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(
         a_ids, a_tool_lists, tool_names
@@ -321,12 +317,12 @@ def main():
     agent_tool_idx_padded = torch.from_numpy(agent_tool_idx_padded).long()
     agent_tool_mask = torch.from_numpy(agent_tool_mask).float()
 
-    qid2idx = {qid: i for i, qid in enumerate(q_ids)}
-    aid2idx = {aid: i for i, aid in enumerate(a_ids)}
-    qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
+    qid2idx = boot.qid2idx
+    aid2idx = boot.aid2idx
+    qids_in_rank = boot.qids_in_rank
 
-    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
-    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    data_sig = boot.data_sig
+    exp_cache_dir = boot.exp_cache_dir
     transformer_cache_key = f"{data_sig}_{cache_key_from_text(args.pretrained_model)}"
     transformer_cache_dir = ensure_transformer_cache_dir(
         shared_cache_dir(args.data_root, "transformer", transformer_cache_key)

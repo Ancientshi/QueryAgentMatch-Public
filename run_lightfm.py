@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
+import argparse
 import json
 import math
-import argparse
-import random
+import os
 import pickle
+import random
 from datetime import datetime
 
 import numpy as np
@@ -14,13 +14,8 @@ import torch
 from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from agent_rec.config import POS_TOPK, EVAL_TOPK, TFIDF_MAX_FEATURES
-from agent_rec.data import (
-    ensure_cache_dir,
-    dataset_signature,
-    stratified_train_valid_split,
-    build_training_pairs,
-)
+from agent_rec.config import EVAL_TOPK, POS_TOPK, TFIDF_MAX_FEATURES
+from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
     build_agent_tool_id_buffers,
     build_feature_cache,
@@ -36,15 +31,10 @@ from agent_rec.knn import build_knn_cache, build_knn_cache_with_vectorizer, load
 from agent_rec.eval import evaluate_sampled_knn_top10, split_eval_qids_by_part
 from agent_rec.models.lightfm import LightFM, bpr_loss, csr_to_bag_lists
 from agent_rec.run_common import (
-    build_id_maps,
+    bootstrap_run,
     cache_key_from_meta,
-    load_data_bundle,
     load_or_build_training_cache,
-    qids_with_rankings_and_log,
     shared_cache_dir,
-    set_global_seed,
-    summarize_bundle,
-    warn_if_topk_diff,
 )
 
 from utils import print_metrics_table  # 依赖你现有 utils.py
@@ -80,11 +70,16 @@ def main():
     parser.add_argument("--topk", type=int, default=EVAL_TOPK, help="Fixed to 10 by default")
 
     args = parser.parse_args()
-    warn_if_topk_diff(args.topk)
+    boot = bootstrap_run(
+        data_root=args.data_root,
+        exp_name=args.exp_name,
+        topk=args.topk,
+        seed=1234,
+        with_tools=True,
+    )
 
-    set_global_seed(1234)
-
-    bundle, tools = load_data_bundle(args.data_root, with_tools=True)
+    bundle = boot.bundle
+    tools = boot.tools
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings
@@ -92,13 +87,13 @@ def main():
 
     tool_names = list(tools.keys())
 
-    summarize_bundle(bundle, tools)
-
-    q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
-    qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
-
-    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
-    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    q_ids = boot.q_ids
+    a_ids = boot.a_ids
+    qid2idx = boot.qid2idx
+    aid2idx = boot.aid2idx
+    qids_in_rank = boot.qids_in_rank
+    data_sig = boot.data_sig
+    exp_cache_dir = boot.exp_cache_dir
     feature_cache_dir = shared_cache_dir(
         args.data_root,
         "features",

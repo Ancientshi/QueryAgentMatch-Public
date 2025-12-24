@@ -26,12 +26,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from agent_rec.config import POS_TOPK, EVAL_TOPK
-from agent_rec.data import (
-    dataset_signature,
-    ensure_cache_dir,
-    stratified_train_valid_split,
-)
+from agent_rec.config import EVAL_TOPK, POS_TOPK
+from agent_rec.data import stratified_train_valid_split
 from agent_rec.eval import split_eval_qids_by_part
 from agent_rec.features import (
     build_twotower_bge_feature_cache,
@@ -41,16 +37,11 @@ from agent_rec.features import (
 )
 from agent_rec.models.two_tower import TwoTowerTFIDF
 from agent_rec.run_common import (
-    build_id_maps,
+    bootstrap_run,
     cache_key_from_meta,
     cache_key_from_text,
-    load_data_bundle,
     load_or_build_training_cache,
-    qids_with_rankings_and_log,
     shared_cache_dir,
-    set_global_seed,
-    summarize_bundle,
-    warn_if_topk_diff,
 )
 from utils import print_metrics_table
 
@@ -204,23 +195,28 @@ def main() -> None:
     parser.add_argument("--use_agent_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
     args = parser.parse_args()
 
-    warn_if_topk_diff(args.topk)
+    boot = bootstrap_run(
+        data_root=args.data_root,
+        exp_name=args.exp_name,
+        topk=args.topk,
+        seed=1234,
+        with_tools=True,
+    )
 
-    set_global_seed(1234)
-
-    bundle, tools = load_data_bundle(args.data_root, with_tools=True)
+    bundle = boot.bundle
+    tools = boot.tools
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings
     qid_to_part = bundle.qid_to_part
 
-    summarize_bundle(bundle, tools)
-
-    q_ids, a_ids, qid2idx, aid2idx = build_id_maps(all_questions, all_agents)
-    qids_in_rank = qids_with_rankings_and_log(q_ids, all_rankings)
-
-    data_sig = dataset_signature(qids_in_rank, a_ids, {k: all_rankings[k] for k in qids_in_rank})
-    exp_cache_dir = ensure_cache_dir(args.data_root, args.exp_name)
+    q_ids = boot.q_ids
+    a_ids = boot.a_ids
+    qid2idx = boot.qid2idx
+    aid2idx = boot.aid2idx
+    qids_in_rank = boot.qids_in_rank
+    data_sig = boot.data_sig
+    exp_cache_dir = boot.exp_cache_dir
     embed_sig = cache_key_from_text(f"{args.embed_url}|{args.embed_batch}")
     feature_cache_dir = shared_cache_dir(
         args.data_root,
