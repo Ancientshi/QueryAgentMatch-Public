@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import stratified_train_valid_split
 from agent_rec.eval import split_eval_qids_by_part
@@ -164,22 +165,21 @@ def evaluate_sampled_twotower(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--exp_name", type=str, default="two_tower_bge")
+    add_shared_training_args(
+        parser,
+        exp_name_default="two_tower_bge",
+        device_default="cpu",
+        epochs_default=3,
+        batch_size_default=512,
+        lr_default=3e-4,
+        include_neg_per_pos=False,
+        include_eval_cand=False,
+    )
     parser.add_argument("--embed_url", type=str, default="http://127.0.0.1:8502/get_embedding")
     parser.add_argument("--embed_batch", type=int, default=64)
     parser.add_argument("--hid", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--rng_seed_pairs", type=int, default=42)
-    parser.add_argument("--split_seed", type=int, default=42)
-    parser.add_argument("--valid_ratio", type=float, default=0.2)
-    parser.add_argument("--topk", type=int, default=EVAL_TOPK)
-    parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--rebuild_feature_cache", type=int, default=0)
-    parser.add_argument("--rebuild_training_cache", type=int, default=0)
     parser.add_argument("--eval_chunk", type=int, default=8192, help="batch size over agents for inference")
     parser.add_argument("--amp", type=int, default=0, help="1 to enable autocast on CUDA (bfloat16)")
     parser.add_argument("--use_tool_emb", type=int, default=1)
