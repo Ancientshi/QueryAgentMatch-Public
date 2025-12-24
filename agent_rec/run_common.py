@@ -3,7 +3,7 @@ import os
 import random
 import zlib
 from dataclasses import dataclass
-from typing import Callable, Iterable, Tuple
+from typing import Callable, Iterable, List, Tuple
 
 import numpy as np
 import torch
@@ -15,9 +15,15 @@ DEFAULT_PARTS = ("PartI", "PartII", "PartIII")
 
 
 def set_global_seed(seed: int = 1234) -> None:
+    print(f"[seed] Setting global seed to {seed}")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def warn_if_topk_diff(topk: int, expected: int = EVAL_TOPK) -> None:
@@ -50,8 +56,8 @@ def summarize_bundle(bundle, tools=None) -> None:
 
 
 def build_id_maps(all_questions, all_agents):
-    q_ids = list(all_questions.keys())
-    a_ids = list(all_agents.keys())
+    q_ids = sorted(all_questions.keys())
+    a_ids = sorted(all_agents.keys())
     qid2idx = {qid: i for i, qid in enumerate(q_ids)}
     aid2idx = {aid: i for i, aid in enumerate(a_ids)}
     return q_ids, a_ids, qid2idx, aid2idx
@@ -174,6 +180,8 @@ def load_or_build_training_cache(
         if meta != want_meta:
             print("[cache] training cache meta mismatch, rebuilding...")
             use_cache = False
+        else:
+            print(f"[cache] loaded {save_message} from {cache_dir}")
 
     if not use_cache:
         train_qids, valid_qids, pairs_idx_np = build_cache_fn()
@@ -187,3 +195,23 @@ def load_or_build_training_cache(
         print(f"[cache] saved {save_message} to {cache_dir}")
 
     return train_qids, valid_qids, pairs_idx_np
+
+
+def build_pos_pairs(
+    rankings: dict,
+    *,
+    qid_to_part: dict,
+    pos_topk_by_part: dict,
+    pos_topk_default: int,
+    rng_seed: int = 42,
+) -> List[Tuple[str, str]]:
+    """Build (qid, pos_aid) pairs using part-aware top-k cutoff."""
+    rnd = random.Random(rng_seed)
+    pairs: List[Tuple[str, str]] = []
+    for qid, ranked in rankings.items():
+        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default)
+        pos_list = ranked[:k] if ranked else []
+        for pos_a in pos_list:
+            pairs.append((qid, pos_a))
+    rnd.shuffle(pairs)
+    return pairs
