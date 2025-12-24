@@ -41,6 +41,7 @@ from agent_rec.models.two_tower import TwoTowerTFIDF
 from agent_rec.run_common import (
     bootstrap_run,
     cache_key_from_meta,
+    build_pos_pairs,
     load_or_build_training_cache,
     shared_cache_dir,
 )
@@ -52,25 +53,6 @@ def info_nce_loss(qe: torch.Tensor, ae: torch.Tensor, temperature: float = 0.07)
     logits = qe @ ae.t()
     labels = torch.arange(qe.size(0), device=qe.device)
     return torch.nn.functional.cross_entropy(logits / temperature, labels)
-
-
-def build_pos_pairs(
-    rankings: Dict[str, List[str]],
-    *,
-    qid_to_part: Dict[str, str],
-    pos_topk_by_part: Dict[str, int] = POS_TOPK_BY_PART,
-    pos_topk_default: int = POS_TOPK,
-    rng_seed: int = 42,
-) -> List[Tuple[str, str]]:
-    rnd = random.Random(rng_seed)
-    pairs = []
-    for qid, ranked in rankings.items():
-        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default)
-        pos_list = ranked[:k] if ranked else []
-        for pos_a in pos_list:
-            pairs.append((qid, pos_a))
-    rnd.shuffle(pairs)
-    return pairs
 
 
 @torch.no_grad()

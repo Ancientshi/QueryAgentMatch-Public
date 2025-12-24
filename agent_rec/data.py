@@ -22,8 +22,8 @@ def ensure_cache_dir(data_root: str, exp_name: str) -> str:
 
 def dataset_signature(q_ids: List[str], a_ids: List[str], rankings: Dict[str, List[str]]) -> str:
     payload = {
-        "q_ids": q_ids,
-        "a_ids": a_ids,
+        "q_ids": sorted(q_ids),
+        "a_ids": sorted(a_ids),
         "rankings": {k: rankings[k] for k in sorted(rankings.keys())},
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
