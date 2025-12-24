@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
+from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.eval import evaluate_sampled_embedding_topk, split_eval_qids_by_part
@@ -248,25 +249,21 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--exp_name", type=str, default="bpr_bert")
+    add_shared_training_args(
+        parser,
+        exp_name_default="bpr_bert",
+        device_default="cuda:0",
+        epochs_default=3,
+        batch_size_default=256,
+        lr_default=1e-3,
+        lr_help="LR for BPR head / embeddings",
+    )
     parser.add_argument("--pretrained_model", type=str, default="distilbert-base-uncased")
     parser.add_argument("--max_len", type=int, default=128)
     parser.add_argument("--text_hidden", type=int, default=256)
     parser.add_argument("--id_dim", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=1e-3, help="LR for BPR head / embeddings")
     parser.add_argument("--encoder_lr", type=float, default=5e-5)
     parser.add_argument("--encoder_weight_decay", type=float, default=0.0)
-    parser.add_argument("--neg_per_pos", type=int, default=1)
-    parser.add_argument("--rng_seed_pairs", type=int, default=42)
-    parser.add_argument("--split_seed", type=int, default=42)
-    parser.add_argument("--valid_ratio", type=float, default=0.2)
-    parser.add_argument("--topk", type=int, default=EVAL_TOPK)
-    parser.add_argument("--eval_cand_size", type=int, default=100)
-    parser.add_argument("--device", type=str, default="cude:0")
-    parser.add_argument("--rebuild_training_cache", type=int, default=0)
     parser.add_argument("--rebuild_embedding_cache", type=int, default=0)
     parser.add_argument("--pooling", type=str, choices=["cls", "mean"], default="cls")
     parser.add_argument(

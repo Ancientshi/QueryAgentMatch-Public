@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FEATURES
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
@@ -31,23 +32,18 @@ from utils import print_metrics_table
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--exp_name", type=str, default="bpr_dnn", help="Cache folder name under .cache/")
+    add_shared_training_args(
+        parser,
+        exp_name_default="bpr_dnn",
+        device_default="cpu",
+        epochs_default=5,
+        batch_size_default=1024,
+        lr_default=1e-3,
+    )
     parser.add_argument("--text_hidden", type=int, default=256)
     parser.add_argument("--id_dim", type=int, default=64)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--neg_per_pos", type=int, default=1)
-    parser.add_argument("--rng_seed_pairs", type=int, default=42)
-    parser.add_argument("--split_seed", type=int, default=42)
-    parser.add_argument("--valid_ratio", type=float, default=0.2)
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--rebuild_training_cache", type=int, default=0)
     parser.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
     parser.add_argument("--rebuild_feature_cache", type=int, default=0)
-    parser.add_argument("--eval_cand_size", type=int, default=100)
-    parser.add_argument("--topk", type=int, default=EVAL_TOPK, help="Fixed to 10 by default")
     parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to add optional query-ID embedding")
 
     args = parser.parse_args()

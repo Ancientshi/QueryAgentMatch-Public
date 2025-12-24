@@ -14,6 +14,7 @@ import torch
 from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FEATURES
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
@@ -42,18 +43,15 @@ from utils import print_metrics_table  # 依赖你现有 utils.py
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--exp_name", type=str, default="lightfm", help="Cache folder name under .cache/")
+    add_shared_training_args(
+        parser,
+        exp_name_default="lightfm",
+        device_default="cpu",
+        epochs_default=5,
+        batch_size_default=4096,
+        lr_default=5e-3,
+    )
     parser.add_argument("--factors", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=4096)
-    parser.add_argument("--lr", type=float, default=5e-3)
-    parser.add_argument("--neg_per_pos", type=int, default=1)
-    parser.add_argument("--rng_seed_pairs", type=int, default=42)
-    parser.add_argument("--split_seed", type=int, default=42)
-    parser.add_argument("--valid_ratio", type=float, default=0.2)
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--rebuild_training_cache", type=int, default=0)
 
     parser.add_argument("--alpha_id", type=float, default=1.0)
     parser.add_argument("--alpha_feat", type=float, default=1.0)
@@ -66,8 +64,6 @@ def main():
     parser.add_argument("--alpha_tool", type=float, default=1.0)
 
     parser.add_argument("--knn_N", type=int, default=3)
-    parser.add_argument("--eval_cand_size", type=int, default=100)
-    parser.add_argument("--topk", type=int, default=EVAL_TOPK, help="Fixed to 10 by default")
 
     args = parser.parse_args()
     boot = bootstrap_run(
