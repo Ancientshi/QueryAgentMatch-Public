@@ -2,13 +2,14 @@ import json
 import os
 import random
 import zlib
+from dataclasses import dataclass
 from typing import Callable, Iterable, Tuple
 
 import numpy as np
 import torch
 
 from agent_rec.config import EVAL_TOPK
-from agent_rec.data import collect_data, load_tools, qids_with_rankings
+from agent_rec.data import collect_data, dataset_signature, ensure_cache_dir, load_tools, qids_with_rankings
 
 DEFAULT_PARTS = ("PartI", "PartII", "PartIII")
 
@@ -92,6 +93,58 @@ def cache_key_from_meta(meta: dict) -> str:
 def cache_key_from_text(text: str) -> str:
     payload = text.encode("utf-8")
     return f"{(zlib.crc32(payload) & 0xFFFFFFFF):08x}"
+
+
+@dataclass
+class RunBootstrap:
+    bundle: object
+    tools: object
+    q_ids: list
+    a_ids: list
+    qid2idx: dict
+    aid2idx: dict
+    qids_in_rank: list
+    data_sig: str
+    exp_cache_dir: str
+
+
+def bootstrap_run(
+    data_root: str,
+    exp_name: str,
+    *,
+    topk: int,
+    seed: int,
+    with_tools: bool = False,
+    parts: Iterable[str] = DEFAULT_PARTS,
+) -> RunBootstrap:
+    """Standardized bootstrap for run_*.py entrypoints.
+
+    Handles seed setting, data loading, summary logging, id mapping,
+    ranking filtering, dataset signature calculation, and experiment cache dir creation.
+    """
+
+    warn_if_topk_diff(topk)
+    set_global_seed(seed)
+
+    bundle, tools = load_data_bundle(data_root, parts=list(parts), with_tools=with_tools)
+    summarize_bundle(bundle, tools)
+
+    q_ids, a_ids, qid2idx, aid2idx = build_id_maps(bundle.all_questions, bundle.all_agents)
+    qids_in_rank = qids_with_rankings_and_log(q_ids, bundle.all_rankings)
+    data_sig = dataset_signature(qids_in_rank, a_ids, {k: bundle.all_rankings[k] for k in qids_in_rank})
+    exp_cache_dir = ensure_cache_dir(data_root, exp_name)
+
+    return RunBootstrap(
+        bundle=bundle,
+        tools=tools,
+        q_ids=q_ids,
+        a_ids=a_ids,
+        qid2idx=qid2idx,
+        aid2idx=aid2idx,
+        qids_in_rank=qids_in_rank,
+        data_sig=data_sig,
+        exp_cache_dir=exp_cache_dir,
+    )
 
 
 def load_or_build_training_cache(
