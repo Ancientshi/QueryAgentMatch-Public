@@ -126,7 +126,10 @@ def stratified_train_valid_split(
 def build_training_pairs(
     rankings_train: Dict[str, List[str]],
     all_agent_ids: List[str],
-    pos_topk: int,
+    *,
+    qid_to_part: Optional[Dict[str, str]] = None,
+    pos_topk_by_part: Optional[Dict[str, int]] = None,
+    pos_topk_default: int | None = None,
     neg_per_pos: int = 1,
     rng_seed: int = 42,
 ) -> List[Tuple[str, str, str]]:
@@ -134,9 +137,17 @@ def build_training_pairs(
     rnd = random.Random(rng_seed)
     pairs: List[Tuple[str, str, str]] = []
     all_agent_set = set(all_agent_ids)
+    from agent_rec.config import POS_TOPK, POS_TOPK_BY_PART
+
+    topk_map = pos_topk_by_part or POS_TOPK_BY_PART
+    topk_default = POS_TOPK if pos_topk_default is None else pos_topk_default
 
     for qid, ranked in rankings_train.items():
-        pos = [aid for aid in ranked[:pos_topk] if aid in all_agent_set]
+        if qid_to_part is not None:
+            k = topk_map.get(qid_to_part.get(qid), topk_default)
+        else:
+            k = topk_default
+        pos = [aid for aid in ranked[:k] if aid in all_agent_set]
         if not pos:
             continue
         pos_set = set(pos)

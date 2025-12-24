@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from agent_rec.config import EVAL_TOPK, POS_TOPK
+from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import stratified_train_valid_split
 from agent_rec.eval import split_eval_qids_by_part
 from agent_rec.features import (
@@ -54,13 +54,17 @@ def info_nce_loss(qe: torch.Tensor, ae: torch.Tensor, temperature: float = 0.07)
 
 def build_pos_pairs(
     rankings: Dict[str, List[str]],
-    pos_topk: int = POS_TOPK,
+    *,
+    qid_to_part: Dict[str, str],
+    pos_topk_by_part: Dict[str, int] = POS_TOPK_BY_PART,
+    pos_topk_default: int = POS_TOPK,
     rng_seed: int = 42,
 ) -> List[Tuple[str, str]]:
     rnd = random.Random(rng_seed)
     pairs = []
     for qid, ranked in rankings.items():
-        pos_list = ranked[:pos_topk] if ranked else []
+        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default)
+        pos_list = ranked[:k] if ranked else []
         for pos_a in pos_list:
             pairs.append((qid, pos_a))
     rnd.shuffle(pairs)
@@ -81,6 +85,9 @@ def evaluate_sampled_twotower(
     cand_size: int = 100,
     rng_seed: int = 123,
     amp: bool = False,
+    qid_to_part: Dict[str, str] | None = None,
+    pos_topk_by_part: Dict[str, int] = POS_TOPK_BY_PART,
+    pos_topk_default: int = POS_TOPK,
 ) -> Dict[int, Dict[str, float]]:
     max_k = max(ks)
     aid2idx = {aid: i for i, aid in enumerate(a_ids)}
@@ -92,7 +99,8 @@ def evaluate_sampled_twotower(
 
     pbar = tqdm(eval_qids, desc="Evaluating (sampled)", leave=True, dynamic_ncols=True)
     for qid in pbar:
-        gt_list = [aid for aid in all_rankings.get(qid, [])[:POS_TOPK] if aid in aid2idx]
+        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default) if qid_to_part else pos_topk_default
+        gt_list = [aid for aid in all_rankings.get(qid, [])[:k] if aid in aid2idx]
         if not gt_list:
             skipped += 1
             pbar.set_postfix({"done": cnt, "skipped": skipped})
@@ -110,6 +118,7 @@ def evaluate_sampled_twotower(
         qv = torch.from_numpy(Q_cpu[qi : qi + 1]).to(device)
         cand_idx = [aid2idx[a] for a in cand_ids]
         av = torch.from_numpy(A_cpu[cand_idx]).to(device)
+        q_idx_t = torch.tensor([qi], dtype=torch.long, device=device)
 
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -117,7 +126,7 @@ def evaluate_sampled_twotower(
             else nullcontext()
         )
         with autocast_ctx:
-            qe = encoder.encode_q(qv)
+            qe = encoder.encode_q(qv, q_idx=q_idx_t)
             ae = encoder.encode_a(av, torch.tensor(cand_idx, device=device, dtype=torch.long))
             scores = (qe @ ae.t()).float().squeeze(0).cpu().numpy()
 
@@ -193,6 +202,7 @@ def main() -> None:
     parser.add_argument("--amp", type=int, default=0, help="1 to enable autocast on CUDA (bfloat16)")
     parser.add_argument("--use_tool_emb", type=int, default=1)
     parser.add_argument("--use_agent_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
+    parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to add query-ID embedding into query tower")
     args = parser.parse_args()
 
     boot = bootstrap_run(
@@ -244,7 +254,7 @@ def main() -> None:
 
     want_meta = {
         "data_sig": data_sig,
-        "pos_topk": int(POS_TOPK),
+        "pos_topk_by_part": POS_TOPK_BY_PART,
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
         "valid_ratio": float(args.valid_ratio),
@@ -256,7 +266,13 @@ def main() -> None:
         train_qids, valid_qids = stratified_train_valid_split(
             qids_in_rank, qid_to_part=bundle.qid_to_part, valid_ratio=args.valid_ratio, seed=args.split_seed
         )
-        pairs = build_pos_pairs({qid: all_rankings[qid] for qid in train_qids}, rng_seed=args.rng_seed_pairs)
+        pairs = build_pos_pairs(
+            {qid: all_rankings[qid] for qid in train_qids},
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
+            rng_seed=args.rng_seed_pairs,
+        )
         pairs_idx = [(qid2idx[q], aid2idx[a]) for (q, a) in pairs]
         pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
         return train_qids, valid_qids, pairs_idx_np
@@ -279,6 +295,8 @@ def main() -> None:
         tool_emb=bool(args.use_tool_emb),
         num_agents=len(a_ids),
         use_agent_id_emb=bool(args.use_agent_id_emb),
+        num_queries=len(q_ids),
+        use_query_id_emb=bool(args.use_query_id_emb),
     ).to(device)
 
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
@@ -302,6 +320,7 @@ def main() -> None:
             a_idx = batch[:, 1]
 
             q_vec = torch.from_numpy(Q_cpu[q_idx]).to(device, non_blocking=True)
+            q_idx_t = torch.from_numpy(q_idx).to(device, non_blocking=True)
             a_pos = torch.from_numpy(A_cpu[a_idx]).to(device, non_blocking=True)
             a_idx_t = torch.from_numpy(a_idx).to(device, non_blocking=True)
 
@@ -309,7 +328,7 @@ def main() -> None:
                 torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
             )
             with autocast_ctx:
-                qe = encoder.encode_q(q_vec)
+                qe = encoder.encode_q(q_vec, q_idx=q_idx_t)
                 ae = encoder.encode_a(a_pos, a_idx_t)
                 loss = info_nce_loss(qe, ae, temperature=args.temperature)
 
@@ -372,6 +391,9 @@ def main() -> None:
         cand_size=100,
         rng_seed=123,
         amp=use_amp,
+        qid_to_part=qid_to_part,
+        pos_topk_by_part=POS_TOPK_BY_PART,
+        pos_topk_default=POS_TOPK,
     )
     print_metrics_table(
         "Validation Overall (averaged over questions)", valid_metrics, ks=(topk,), filename=args.exp_name
@@ -395,6 +417,9 @@ def main() -> None:
             cand_size=100,
             rng_seed=123,
             amp=use_amp,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
         )
         print_metrics_table(
             f"Validation {part} (averaged over questions)", m_part, ks=(topk,), filename=args.exp_name
@@ -404,7 +429,8 @@ def main() -> None:
     def recommend_topk_for_qid(qid: str, topk: int = 10, chunk: int = 8192):
         qi = qid2idx[qid]
         qv = torch.from_numpy(Q_cpu[qi : qi + 1]).to(device)
-        qe = encoder.encode_q(qv)
+        q_idx_t = torch.tensor([qi], dtype=torch.long, device=device)
+        qe = encoder.encode_q(qv, q_idx=q_idx_t)
 
         best_scores: List[float] = []
         best_ids: List[int] = []

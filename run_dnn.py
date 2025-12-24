@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from agent_rec.config import EVAL_TOPK, POS_TOPK, TFIDF_MAX_FEATURES
+from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FEATURES
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
     build_feature_cache,
@@ -48,6 +48,7 @@ def main():
     parser.add_argument("--rebuild_feature_cache", type=int, default=0)
     parser.add_argument("--eval_cand_size", type=int, default=100)
     parser.add_argument("--topk", type=int, default=EVAL_TOPK, help="Fixed to 10 by default")
+    parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to add optional query-ID embedding")
 
     args = parser.parse_args()
     boot = bootstrap_run(
@@ -106,7 +107,7 @@ def main():
 
     want_meta = {
         "data_sig": data_sig,
-        "pos_topk": int(POS_TOPK),
+        "pos_topk_by_part": POS_TOPK_BY_PART,
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
@@ -122,7 +123,13 @@ def main():
 
         rankings_train = {qid: all_rankings[qid] for qid in train_qids}
         pairs = build_training_pairs(
-            rankings_train, a_ids, pos_topk=POS_TOPK, neg_per_pos=args.neg_per_pos, rng_seed=args.rng_seed_pairs
+            rankings_train,
+            a_ids,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
+            neg_per_pos=args.neg_per_pos,
+            rng_seed=args.rng_seed_pairs,
         )
         pairs_idx = [(qid2idx[q], aid2idx[p], aid2idx[n]) for (q, p, n) in pairs]
         pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
@@ -145,6 +152,8 @@ def main():
         agent_tool_mask=torch.tensor(tool_mask_np, dtype=torch.float32, device=device),
         text_hidden=args.text_hidden,
         id_dim=args.id_dim,
+        num_queries=len(q_ids),
+        use_query_id_emb=bool(args.use_query_id_emb),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -173,7 +182,7 @@ def main():
             pos_vec = A_t[pos_idx]
             neg_vec = A_t[neg_idx]
 
-            pos, neg = model(q_vec, pos_vec, neg_vec, pos_idx, neg_idx)
+            pos, neg = model(q_vec, pos_vec, neg_vec, pos_idx, neg_idx, q_idx=q_idx)
             loss = bpr_loss(pos, neg)
 
             optimizer.zero_grad()
@@ -219,13 +228,16 @@ def main():
     overall_metrics = evaluate_sampled_direct_top10(
         model=model,
         aid2idx=aid2idx,
+        qid2idx=qid2idx,
         all_rankings=all_rankings,
         all_questions=all_questions,
         eval_qids=valid_qids,
         q_vectorizer=q_vectorizer_runtime,
         A_text_full=A_text_full_np,
         cand_size=args.eval_cand_size,
-        pos_topk=POS_TOPK,
+        qid_to_part=qid_to_part,
+        pos_topk_by_part=POS_TOPK_BY_PART,
+        pos_topk_default=POS_TOPK,
         topk=topk,
         seed=123,
         desc=f"Valid Overall (direct q-vector, top{topk})",
@@ -240,13 +252,16 @@ def main():
         m_part = evaluate_sampled_direct_top10(
             model=model,
             aid2idx=aid2idx,
+            qid2idx=qid2idx,
             all_rankings=all_rankings,
             all_questions=all_questions,
             eval_qids=qids_part,
             q_vectorizer=q_vectorizer_runtime,
             A_text_full=A_text_full_np,
             cand_size=args.eval_cand_size,
-            pos_topk=POS_TOPK,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
             topk=topk,
             seed=123,
             desc=f"Valid {part} (direct q-vector, top{topk})",

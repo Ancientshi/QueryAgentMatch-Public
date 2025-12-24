@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-from agent_rec.config import EVAL_TOPK, POS_TOPK
+from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.eval import evaluate_sampled_embedding_topk, split_eval_qids_by_part
 from agent_rec.features import build_agent_tool_id_buffers, build_transformer_corpora
@@ -283,6 +283,7 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--lora_targets", type=str, default="q_lin,k_lin,v_lin,out_lin")
+    parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to enable query-ID embedding")
     args = parser.parse_args()
 
     boot = bootstrap_run(
@@ -330,7 +331,7 @@ def main():
 
     want_meta = {
         "data_sig": data_sig,
-        "pos_topk": int(POS_TOPK),
+        "pos_topk_by_part": POS_TOPK_BY_PART,
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
@@ -346,7 +347,13 @@ def main():
 
         rankings_train = {qid: all_rankings[qid] for qid in train_qids}
         pairs = build_training_pairs(
-            rankings_train, a_ids, pos_topk=POS_TOPK, neg_per_pos=args.neg_per_pos, rng_seed=args.rng_seed_pairs
+            rankings_train,
+            a_ids,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
+            neg_per_pos=args.neg_per_pos,
+            rng_seed=args.rng_seed_pairs,
         )
         pairs_idx = [(qid2idx[q], aid2idx[p], aid2idx[n]) for (q, p, n) in pairs]
         pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
@@ -489,6 +496,8 @@ def main():
         agent_tool_mask=agent_tool_mask.to(device),
         text_hidden=args.text_hidden,
         id_dim=args.id_dim,
+        num_queries=len(q_ids),
+        use_query_id_emb=bool(args.use_query_id_emb),
     ).to(device)
 
     head_params = list(model.parameters())
@@ -556,7 +565,7 @@ def main():
                 pos_vec = pos_vec_uniq[inv_pos]
                 neg_vec = neg_vec_uniq[inv_neg]
 
-            pos, neg = model(q_vec, pos_vec, neg_vec, pos_idx, neg_idx)
+            pos, neg = model(q_vec, pos_vec, neg_vec, pos_idx, neg_idx, q_idx=q_idx)
             loss = bpr_loss(pos, neg)
 
             optimizer.zero_grad()
@@ -631,7 +640,9 @@ def main():
         Q_t=Q_t,
         A_t=A_t,
         cand_size=args.eval_cand_size,
-        pos_topk=POS_TOPK,
+        qid_to_part=qid_to_part,
+        pos_topk_by_part=POS_TOPK_BY_PART,
+        pos_topk_default=POS_TOPK,
         topk=int(args.topk),
         seed=123,
         desc=f"Valid Overall (transformer, top{int(args.topk)})",
@@ -652,7 +663,9 @@ def main():
             Q_t=Q_t,
             A_t=A_t,
             cand_size=args.eval_cand_size,
-            pos_topk=POS_TOPK,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
             topk=int(args.topk),
             seed=123,
             desc=f"Valid {part} (transformer, top{int(args.topk)})",

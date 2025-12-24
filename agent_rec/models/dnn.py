@@ -24,6 +24,8 @@ class SimpleBPRDNN(nn.Module):
         agent_tool_mask: torch.FloatTensor,
         text_hidden: int = 256,
         id_dim: int = 64,
+        num_queries: int = 0,
+        use_query_id_emb: bool = False,
     ):
         super().__init__()
         self.q_proj = nn.Linear(d_q, text_hidden)
@@ -31,11 +33,13 @@ class SimpleBPRDNN(nn.Module):
 
         self.emb_agent = nn.Embedding(num_agents, id_dim)
         self.emb_tool = nn.Embedding(num_tools, id_dim)
+        self.use_query_id_emb = bool(use_query_id_emb) and num_queries > 0
+        self.emb_query = nn.Embedding(num_queries, id_dim) if self.use_query_id_emb else None
 
         self.register_buffer("agent_tool_indices_padded", agent_tool_indices_padded)
         self.register_buffer("agent_tool_mask", agent_tool_mask)
 
-        in_dim = text_hidden + text_hidden + id_dim + id_dim
+        in_dim = text_hidden + text_hidden + id_dim + id_dim + (id_dim if self.use_query_id_emb else 0)
         self.scorer = nn.Sequential(
             nn.ReLU(),
             nn.Linear(in_dim, 128),
@@ -59,6 +63,7 @@ class SimpleBPRDNN(nn.Module):
         q_vec: torch.Tensor,
         a_vec: torch.Tensor,
         agent_idx: torch.LongTensor,
+        q_idx: torch.LongTensor | None = None,
     ) -> torch.Tensor:
         qh = F.relu(self.q_proj(q_vec))
         ah = F.relu(self.a_proj(a_vec))
@@ -71,7 +76,12 @@ class SimpleBPRDNN(nn.Module):
         mask3 = mask.unsqueeze(-1)
         te_mean = (te * mask3).sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-8)
 
-        x = torch.cat([qh, ah, ae, te_mean], dim=1)
+        parts = [qh, ah, ae, te_mean]
+        if self.use_query_id_emb:
+            if q_idx is None:
+                raise ValueError("q_idx is required when use_query_id_emb=True")
+            parts.append(self.emb_query(q_idx))
+        x = torch.cat(parts, dim=1)
         s = self.scorer(x).squeeze(1)
         return s
 
@@ -82,7 +92,8 @@ class SimpleBPRDNN(nn.Module):
         neg_vec: torch.Tensor,
         pos_idx: torch.LongTensor,
         neg_idx: torch.LongTensor,
+        q_idx: torch.LongTensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        pos = self.forward_score(q_vec, pos_vec, pos_idx)
-        neg = self.forward_score(q_vec, neg_vec, neg_idx)
+        pos = self.forward_score(q_vec, pos_vec, pos_idx, q_idx=q_idx)
+        neg = self.forward_score(q_vec, neg_vec, neg_idx, q_idx=q_idx)
         return pos, neg

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .config import POS_TOPK, EVAL_TOPK
+from .config import POS_TOPK, POS_TOPK_BY_PART, EVAL_TOPK
 from .knn import knn_qvec_for_question_text
 from .scoring import score_candidates, ScoreMode
 from .models.base import RecommenderBase
@@ -55,8 +55,10 @@ def evaluate_sampled_knn_top10(
     eval_qids: List[str],
     knn_cache: dict,
     cand_size: int = 100,
-    knn_N: int = 8,
-    pos_topk: int = POS_TOPK,
+    knn_N: int = 3,
+    qid_to_part: Optional[Dict[str, str]] = None,
+    pos_topk_by_part: Dict[str, int] = POS_TOPK_BY_PART,
+    pos_topk_default: int = POS_TOPK,
     topk: int = EVAL_TOPK,
     score_mode: ScoreMode = "dot",
     seed: int = 123,
@@ -80,7 +82,8 @@ def evaluate_sampled_knn_top10(
 
     pbar = tqdm(eval_qids, desc=desc, leave=True, dynamic_ncols=True)
     for qid in pbar:
-        gt = [aid for aid in all_rankings.get(qid, [])[:pos_topk] if aid in aid2idx]
+        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default) if qid_to_part else pos_topk_default
+        gt = [aid for aid in all_rankings.get(qid, [])[:k] if aid in aid2idx]
         if not gt:
             skipped += 1
             pbar.set_postfix({"done": cnt, "skipped": skipped})
@@ -142,13 +145,16 @@ def split_eval_qids_by_part(eval_qids: List[str], qid_to_part: Dict[str, str]) -
 def evaluate_sampled_direct_top10(
     model,
     aid2idx: Dict[str, int],
+    qid2idx: Dict[str, int],
     all_rankings: Dict[str, List[str]],
     all_questions: Dict[str, dict],
     eval_qids: List[str],
     q_vectorizer,
     A_text_full: np.ndarray,
     cand_size: int = 100,
-    pos_topk: int = POS_TOPK,
+    qid_to_part: Optional[Dict[str, str]] = None,
+    pos_topk_by_part: Dict[str, int] = POS_TOPK_BY_PART,
+    pos_topk_default: int = POS_TOPK,
     topk: int = EVAL_TOPK,
     seed: int = 123,
     desc: str = "Evaluating",
@@ -171,7 +177,8 @@ def evaluate_sampled_direct_top10(
 
     pbar = tqdm(eval_qids, desc=desc, leave=True, dynamic_ncols=True)
     for qid in pbar:
-        gt = [aid for aid in all_rankings.get(qid, [])[:pos_topk] if aid in aid2idx]
+        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default) if qid_to_part else pos_topk_default
+        gt = [aid for aid in all_rankings.get(qid, [])[:k] if aid in aid2idx]
         if not gt:
             skipped += 1
             pbar.set_postfix({"done": cnt, "skipped": skipped})
@@ -196,9 +203,10 @@ def evaluate_sampled_direct_top10(
         qv = torch.tensor(qv_np, dtype=torch.float32, device=device).unsqueeze(0)
 
         ai_idx = torch.tensor([aid2idx[a] for a in cand], dtype=torch.long, device=device)
+        q_idx = torch.full((len(cand),), qid2idx[qid], dtype=torch.long, device=device)
         qv_rep = qv.repeat(len(cand), 1)
         with torch.no_grad():
-            scores = model.forward_score(qv_rep, A_t[ai_idx], ai_idx).detach().cpu().numpy()
+            scores = model.forward_score(qv_rep, A_t[ai_idx], ai_idx, q_idx=q_idx).detach().cpu().numpy()
         order = np.argsort(-scores)[:topk]
         pred = [cand[i] for i in order]
 
@@ -235,7 +243,9 @@ def evaluate_sampled_embedding_topk(
     Q_t: torch.Tensor,
     A_t: torch.Tensor,
     cand_size: int = 100,
-    pos_topk: int = POS_TOPK,
+    qid_to_part: Optional[Dict[str, str]] = None,
+    pos_topk_by_part: Dict[str, int] = POS_TOPK_BY_PART,
+    pos_topk_default: int = POS_TOPK,
     topk: int = EVAL_TOPK,
     seed: int = 123,
     desc: str = "Evaluating",
@@ -253,7 +263,8 @@ def evaluate_sampled_embedding_topk(
 
     pbar = tqdm(eval_qids, desc=desc, leave=True, dynamic_ncols=True)
     for qid in pbar:
-        gt = [aid for aid in all_rankings.get(qid, [])[:pos_topk] if aid in aid2idx]
+        k = pos_topk_by_part.get(qid_to_part.get(qid, ""), pos_topk_default) if qid_to_part else pos_topk_default
+        gt = [aid for aid in all_rankings.get(qid, [])[:k] if aid in aid2idx]
         if not gt:
             skipped += 1
             pbar.set_postfix({"done": cnt, "skipped": skipped})
@@ -276,9 +287,10 @@ def evaluate_sampled_embedding_topk(
         qi = qid2idx[qid]
         qv = Q_t[qi : qi + 1].repeat(len(cand), 1)
         ai_idx = torch.tensor([aid2idx[a] for a in cand], dtype=torch.long, device=device)
+        q_idx = torch.full((len(cand),), qi, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            scores = model.forward_score(qv, A_t[ai_idx], ai_idx).detach().cpu().numpy()
+            scores = model.forward_score(qv, A_t[ai_idx], ai_idx, q_idx=q_idx).detach().cpu().numpy()
         order = np.argsort(-scores)[:topk]
         pred = [cand[i] for i in order]
 

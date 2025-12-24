@@ -25,6 +25,8 @@ class TwoTowerTFIDF(RecommenderBase):
         tool_emb: bool = True,
         num_agents: int = 0,
         use_agent_id_emb: bool = False,
+        num_queries: int = 0,
+        use_query_id_emb: bool = False,
         export_batch_size: int = 4096,
     ) -> None:
         super().__init__()
@@ -45,10 +47,23 @@ class TwoTowerTFIDF(RecommenderBase):
         else:
             self.emb_agent = None
 
+        self.use_query_id_emb = bool(use_query_id_emb) and num_queries > 0
+        if self.use_query_id_emb:
+            self.emb_query = nn.Embedding(num_queries, hid)
+            nn.init.xavier_uniform_(self.emb_query.weight)
+        else:
+            self.emb_query = None
+
         self.register_buffer("tool_idx", agent_tool_idx_padded.long())
         self.register_buffer("tool_mask", agent_tool_mask.float())
 
-        for m in list(self.q_proj) + list(self.a_proj):
+        combine_q_dim = hid + (hid if self.use_query_id_emb else 0)
+        combine_a_dim = hid + (hid if self.use_tool_emb else 0) + (hid if self.use_agent_id_emb else 0)
+        self.q_head = nn.Linear(combine_q_dim, hid)
+        self.a_head = nn.Linear(combine_a_dim, hid)
+
+        modules = list(self.q_proj) + list(self.a_proj) + [self.q_head, self.a_head]
+        for m in modules:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
@@ -70,16 +85,24 @@ class TwoTowerTFIDF(RecommenderBase):
         mask = self.tool_mask[agent_idx].unsqueeze(-1)  # (B,T,1)
         return (te * mask).sum(1) / (mask.sum(1) + 1e-8)  # (B,H)
 
-    def encode_q(self, q_vec: torch.Tensor) -> torch.Tensor:
-        qh = self.q_proj(q_vec)
+    def encode_q(self, q_vec: torch.Tensor, q_idx: Optional[torch.LongTensor] = None) -> torch.Tensor:
+        parts = [self.q_proj(q_vec)]
+        if self.use_query_id_emb:
+            if q_idx is None:
+                raise ValueError("q_idx is required when use_query_id_emb=True")
+            parts.append(self.emb_query(q_idx))
+        qh = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+        qh = self.q_head(qh)
         return F.normalize(qh, dim=-1)
 
     def encode_a(self, a_vec: torch.Tensor, agent_idx: torch.LongTensor) -> torch.Tensor:
-        ah = self.a_proj(a_vec)
+        parts = [self.a_proj(a_vec)]
         if self.use_tool_emb:
-            ah = ah + 0.5 * self.tool_agg(agent_idx)
+            parts.append(self.tool_agg(agent_idx))
         if self.use_agent_id_emb:
-            ah = ah + 0.5 * self.emb_agent(agent_idx)
+            parts.append(self.emb_agent(agent_idx))
+        ah = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+        ah = self.a_head(ah)
         return F.normalize(ah, dim=-1)
 
     def forward_score(
@@ -87,8 +110,9 @@ class TwoTowerTFIDF(RecommenderBase):
         q_vec: torch.Tensor,
         a_vec: torch.Tensor,
         agent_idx: torch.LongTensor,
+        q_idx: Optional[torch.LongTensor] = None,
     ) -> torch.Tensor:
-        qe = self.encode_q(q_vec)
+        qe = self.encode_q(q_vec, q_idx=q_idx)
         ae = self.encode_a(a_vec, agent_idx)
         return (qe * ae).sum(dim=-1)
 
@@ -119,7 +143,8 @@ class TwoTowerTFIDF(RecommenderBase):
             for start in range(0, len(q_indices), self.export_batch_size):
                 batch_idx = q_indices[start : start + self.export_batch_size]
                 qv = torch.from_numpy(Q_cpu[batch_idx]).to(device)
-                qe = self.encode_q(qv).cpu().numpy()
+                q_idx = torch.tensor(batch_idx, dtype=torch.long, device=device) if self.use_query_id_emb else None
+                qe = self.encode_q(qv, q_idx=q_idx).cpu().numpy()
                 out.append(qe)
         return np.vstack(out).astype(np.float32)
 
@@ -130,5 +155,6 @@ class TwoTowerTFIDF(RecommenderBase):
         return {
             "use_tool_emb": self.use_tool_emb,
             "use_agent_id_emb": self.use_agent_id_emb,
+            "use_query_id_emb": self.use_query_id_emb,
             "export_batch_size": self.export_batch_size,
         }

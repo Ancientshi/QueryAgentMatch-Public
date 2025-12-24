@@ -14,7 +14,7 @@ import torch
 from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from agent_rec.config import EVAL_TOPK, POS_TOPK, TFIDF_MAX_FEATURES
+from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FEATURES
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
     build_agent_tool_id_buffers,
@@ -154,7 +154,7 @@ def main():
 
     want_meta = {
         "data_sig": data_sig,
-        "pos_topk": int(POS_TOPK),
+        "pos_topk_by_part": POS_TOPK_BY_PART,
         "neg_per_pos": int(args.neg_per_pos),
         "rng_seed_pairs": int(args.rng_seed_pairs),
         "split_seed": int(args.split_seed),
@@ -170,7 +170,13 @@ def main():
 
         rankings_train = {qid: all_rankings[qid] for qid in train_qids}
         pairs = build_training_pairs(
-            rankings_train, a_ids, pos_topk=POS_TOPK, neg_per_pos=args.neg_per_pos, rng_seed=args.rng_seed_pairs
+            rankings_train,
+            a_ids,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
+            neg_per_pos=args.neg_per_pos,
+            rng_seed=args.rng_seed_pairs,
         )
         pairs_idx = [(qid2idx[q], aid2idx[p], aid2idx[n]) for (q, p, n) in pairs]
         pairs_idx_np = np.array(pairs_idx, dtype=np.int64)
@@ -292,7 +298,9 @@ def main():
         knn_cache=knn_cache,
         cand_size=args.eval_cand_size,
         knn_N=args.knn_N,
-        pos_topk=POS_TOPK,
+        qid_to_part=qid_to_part,
+        pos_topk_by_part=POS_TOPK_BY_PART,
+        pos_topk_default=POS_TOPK,
         topk=topk,
         score_mode="dot",
         seed=123,
@@ -314,7 +322,9 @@ def main():
             knn_cache=knn_cache,
             cand_size=args.eval_cand_size,
             knn_N=args.knn_N,
-            pos_topk=POS_TOPK,
+            qid_to_part=qid_to_part,
+            pos_topk_by_part=POS_TOPK_BY_PART,
+            pos_topk_default=POS_TOPK,
             topk=topk,
             score_mode="dot",
             seed=123,
