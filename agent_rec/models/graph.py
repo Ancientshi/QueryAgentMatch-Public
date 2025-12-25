@@ -138,10 +138,29 @@ class GraphRecommenderBase(RecommenderBase):
         if self.use_agent_content and self.content_proj is not None:
             a0 = a0 + self.content_proj(self.agent_content)
         if self.use_tool_id_emb and self.emb_tool is not None:
-            te = self.emb_tool(self.agent_tool_indices)  # (Na, T, D)
-            mask = self.agent_tool_mask.unsqueeze(-1)  # (Na, T, 1)
-            denom = mask.sum(1, keepdim=True).clamp(min=1e-8)
-            a0 = a0 + (te * mask).sum(1) / denom
+            mask = self.agent_tool_mask
+            counts = mask.sum(dim=1).to(torch.long)  # (Na,)
+            valid_idx = mask.bool()
+            flat_idx = self.agent_tool_indices[valid_idx]  # (N_valid,)
+
+            if flat_idx.numel() > 0:
+                offsets = torch.cat(
+                    [
+                        torch.zeros(1, device=counts.device, dtype=torch.long),
+                        counts.cumsum(0)[:-1],
+                    ]
+                )
+                tool_mean = F.embedding_bag(
+                    flat_idx,
+                    self.emb_tool.weight,
+                    offsets,
+                    mode="mean",
+                )
+            else:
+                tool_mean = torch.zeros_like(a0)
+
+            a0 = a0 + tool_mean
+            
         if self.use_llm_id_emb and self.emb_llm is not None:
             a0 = a0 + self.emb_llm(self.agent_llm_idx)
         return q0, a0
