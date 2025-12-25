@@ -14,4 +14,9 @@ python "$SCRIPT_DIR/../../run_lightgcn.py" \
   --batch_size "$BATCH_SIZE" \
   --embed_dim 128 --num_layers 2 --neg_per_pos "$NEG_PER_POS" \
   --knn_N "$KNN_N" --eval_cand_size "$EVAL_CAND_SIZE" --score_mode dot \
-  --exp_name "lightgcn${EXP_SUFFIX}"
+  --use_query_id_emb 1 \
+  --use_llm_id_emb 1 \
+  --use_tool_id_emb 1 \
+  --use_model_content_vector 1 \
+  --use_tool_content_vector 1 \
+  --exp_name "lightgcn"

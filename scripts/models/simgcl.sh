@@ -15,4 +15,9 @@ python "$SCRIPT_DIR/../../run_simgcl.py" \
   --embed_dim 128 --num_layers 2 --cl_weight 0.1 --perturb_eps 0.1 --temperature 0.2 \
   --neg_per_pos "$NEG_PER_POS" \
   --knn_N "$KNN_N" --eval_cand_size "$EVAL_CAND_SIZE" --score_mode dot \
-  --exp_name "simgcl${EXP_SUFFIX}"
+  --use_query_id_emb 1 \
+  --use_llm_id_emb 1 \
+  --use_tool_id_emb 1 \
+  --use_model_content_vector 1 \
+  --use_tool_content_vector 1 \
+  --exp_name "simgcl$"

@@ -430,44 +430,44 @@ def main() -> None:
             f"Validation {part} (averaged over questions)", m_part, ks=(topk,), filename=args.exp_name
         )
 
-    @torch.no_grad()
-    def recommend_topk_for_qid(qid: str, topk: int = 10, chunk: int = 8192):
-        qi = qid2idx[qid]
-        qv = torch.from_numpy(Q_cpu[qi : qi + 1]).to(device)
-        q_idx_t = torch.tensor([qi], dtype=torch.long, device=device)
-        qe = encoder.encode_q(qv, q_idx=q_idx_t)
+    # @torch.no_grad()
+    # def recommend_topk_for_qid(qid: str, topk: int = 10, chunk: int = 8192):
+    #     qi = qid2idx[qid]
+    #     qv = torch.from_numpy(Q_cpu[qi : qi + 1]).to(device)
+    #     q_idx_t = torch.tensor([qi], dtype=torch.long, device=device)
+    #     qe = encoder.encode_q(qv, q_idx=q_idx_t)
 
-        best_scores: List[float] = []
-        best_ids: List[int] = []
-        num_agents = len(a_ids)
-        for i in range(0, num_agents, chunk):
-            j = min(i + chunk, num_agents)
-            a_idx = torch.arange(i, j, dtype=torch.long, device=device)
-            av = torch.from_numpy(A_cpu[i:j]).to(device)
-            ae = encoder.encode_a(av, a_idx)
-            scores = (qe @ ae.t()).squeeze(0)
-            k = min(topk, j - i)
-            top_scores, top_local_idx = torch.topk(scores, k)
-            best_scores.extend(top_scores.cpu().tolist())
-            best_ids.extend([i + int(t) for t in top_local_idx.cpu().tolist()])
+    #     best_scores: List[float] = []
+    #     best_ids: List[int] = []
+    #     num_agents = len(a_ids)
+    #     for i in range(0, num_agents, chunk):
+    #         j = min(i + chunk, num_agents)
+    #         a_idx = torch.arange(i, j, dtype=torch.long, device=device)
+    #         av = torch.from_numpy(A_cpu[i:j]).to(device)
+    #         ae = encoder.encode_a(av, a_idx)
+    #         scores = (qe @ ae.t()).squeeze(0)
+    #         k = min(topk, j - i)
+    #         top_scores, top_local_idx = torch.topk(scores, k)
+    #         best_scores.extend(top_scores.cpu().tolist())
+    #         best_ids.extend([i + int(t) for t in top_local_idx.cpu().tolist()])
 
-        best_scores_t = torch.tensor(best_scores)
-        best_ids_t = torch.tensor(best_ids)
-        k = min(topk, best_scores_t.numel())
-        final_scores, final_idx = torch.topk(best_scores_t, k)
-        result = [
-            (a_ids[int(best_ids_t[idx])], float(final_scores[n].item()))
-            for n, idx in enumerate(final_idx)
-        ]
-        return result
+    #     best_scores_t = torch.tensor(best_scores)
+    #     best_ids_t = torch.tensor(best_ids)
+    #     k = min(topk, best_scores_t.numel())
+    #     final_scores, final_idx = torch.topk(best_scores_t, k)
+    #     result = [
+    #         (a_ids[int(best_ids_t[idx])], float(final_scores[n].item()))
+    #         for n, idx in enumerate(final_idx)
+    #     ]
+    #     return result
 
-    sample_qids = q_ids[: min(5, len(q_ids))]
-    for qid in sample_qids:
-        recs = recommend_topk_for_qid(qid, topk=args.topk, chunk=args.eval_chunk)
-        qtext = all_questions[qid]["input"][:80].replace("\n", " ")
-        print(f"\nQuestion: {qid}  |  {qtext}")
-        for r, (aid, s) in enumerate(recs, 1):
-            print(f"  {r:2d}. {aid:>20s}  score={s:.4f}")
+    # sample_qids = q_ids[: min(5, len(q_ids))]
+    # for qid in sample_qids:
+    #     recs = recommend_topk_for_qid(qid, topk=args.topk, chunk=args.eval_chunk)
+    #     qtext = all_questions[qid]["input"][:80].replace("\n", " ")
+    #     print(f"\nQuestion: {qid}  |  {qtext}")
+    #     for r, (aid, s) in enumerate(recs, 1):
+    #         print(f"  {r:2d}. {aid:>20s}  score={s:.4f}")
 
 
 if __name__ == "__main__":
