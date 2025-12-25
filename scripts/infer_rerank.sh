@@ -18,14 +18,14 @@ SPLIT_SEED="${SPLIT_SEED:-42}"
 
 BGE_BASE_MODEL="${BGE_BASE_MODEL:-BAAI/bge-reranker-base}"
 BGE_BASE_DIR="${BGE_BASE_DIR:-$BGE_BASE_MODEL}"
-BGE_LORA_DIR="${BGE_LORA_DIR:-/path/to/bge-reranker-lora}"
+BGE_LORA_DIR="${BGE_LORA_DIR:-/home/yunxshi/Data/workspace/QueryAgentMatch/benchmark/BGE-Rerank/reranker}"
 
 EASYREC_BASE_URL="${EASYREC_BASE_URL:-http://127.0.0.1:8500/compute_scores}"
 EASYREC_LORA_URL="${EASYREC_LORA_URL:-http://127.0.0.1:8501/compute_scores}"
 
 python "$SCRIPT_DIR/../infer_BGE.py" \
   --data_root "$DATA_ROOT" \
-  --exp_name "infer_bge_base${EXP_SUFFIX}" \
+  --exp_name "infer_bge_base" \
   --model_dir "$BGE_BASE_DIR" \
   --model_name "$BGE_BASE_MODEL" \
   --peft 0 \
@@ -38,50 +38,50 @@ python "$SCRIPT_DIR/../infer_BGE.py" \
   --seed "$SEED" \
   --split_seed "$SPLIT_SEED"
 
-python "$SCRIPT_DIR/../infer_BGE.py" \
-  --data_root "$DATA_ROOT" \
-  --exp_name "infer_bge_lora${EXP_SUFFIX}" \
-  --model_dir "$BGE_LORA_DIR" \
-  --peft 1 \
-  --device "$DEVICE" \
-  --eval_cand_size "$EVAL_CAND_SIZE" \
-  --valid_ratio "$VALID_RATIO" \
-  --max_eval "$MAX_EVAL" \
-  --ks "$KS" \
-  --rerank_batch "$RERANK_BATCH" \
-  --seed "$SEED" \
-  --split_seed "$SPLIT_SEED"
+# python "$SCRIPT_DIR/../infer_BGE.py" \
+#   --data_root "$DATA_ROOT" \
+#   --exp_name "infer_bge_lora" \
+#   --model_dir "$BGE_LORA_DIR" \
+#   --peft 1 \
+#   --device "$DEVICE" \
+#   --eval_cand_size "$EVAL_CAND_SIZE" \
+#   --valid_ratio "$VALID_RATIO" \
+#   --max_eval "$MAX_EVAL" \
+#   --ks "$KS" \
+#   --rerank_batch "$RERANK_BATCH" \
+#   --seed "$SEED" \
+#   --split_seed "$SPLIT_SEED"
 
-python "$SCRIPT_DIR/../infer_EasyRec.py" \
-  --data_root "$DATA_ROOT" \
-  --exp_name "infer_easyrec_base${EXP_SUFFIX}" \
-  --service_url "$EASYREC_BASE_URL" \
-  --eval_cand_size "$EVAL_CAND_SIZE" \
-  --valid_ratio "$VALID_RATIO" \
-  --max_eval "$MAX_EVAL" \
-  --ks "$KS" \
-  --rerank_batch "$RERANK_BATCH" \
-  --timeout "$TIMEOUT" \
-  --max_workers "$MAX_WORKERS" \
-  --http_retries "$HTTP_RETRIES" \
-  --http_backoff "$HTTP_BACKOFF" \
-  --pool_maxsize "$POOL_MAXSIZE" \
-  --seed "$SEED" \
-  --split_seed "$SPLIT_SEED"
+# python "$SCRIPT_DIR/../infer_EasyRec.py" \
+#   --data_root "$DATA_ROOT" \
+#   --exp_name "infer_easyrec_base" \
+#   --service_url "$EASYREC_BASE_URL" \
+#   --eval_cand_size "$EVAL_CAND_SIZE" \
+#   --valid_ratio "$VALID_RATIO" \
+#   --max_eval "$MAX_EVAL" \
+#   --ks "$KS" \
+#   --rerank_batch "$RERANK_BATCH" \
+#   --timeout "$TIMEOUT" \
+#   --max_workers "$MAX_WORKERS" \
+#   --http_retries "$HTTP_RETRIES" \
+#   --http_backoff "$HTTP_BACKOFF" \
+#   --pool_maxsize "$POOL_MAXSIZE" \
+#   --seed "$SEED" \
+#   --split_seed "$SPLIT_SEED"
 
-python "$SCRIPT_DIR/../infer_EasyRec.py" \
-  --data_root "$DATA_ROOT" \
-  --exp_name "infer_easyrec_lora${EXP_SUFFIX}" \
-  --service_url "$EASYREC_LORA_URL" \
-  --eval_cand_size "$EVAL_CAND_SIZE" \
-  --valid_ratio "$VALID_RATIO" \
-  --max_eval "$MAX_EVAL" \
-  --ks "$KS" \
-  --rerank_batch "$RERANK_BATCH" \
-  --timeout "$TIMEOUT" \
-  --max_workers "$MAX_WORKERS" \
-  --http_retries "$HTTP_RETRIES" \
-  --http_backoff "$HTTP_BACKOFF" \
-  --pool_maxsize "$POOL_MAXSIZE" \
-  --seed "$SEED" \
-  --split_seed "$SPLIT_SEED"
+# python "$SCRIPT_DIR/../infer_EasyRec.py" \
+#   --data_root "$DATA_ROOT" \
+#   --exp_name "infer_easyrec_lora" \
+#   --service_url "$EASYREC_LORA_URL" \
+#   --eval_cand_size "$EVAL_CAND_SIZE" \
+#   --valid_ratio "$VALID_RATIO" \
+#   --max_eval "$MAX_EVAL" \
+#   --ks "$KS" \
+#   --rerank_batch "$RERANK_BATCH" \
+#   --timeout "$TIMEOUT" \
+#   --max_workers "$MAX_WORKERS" \
+#   --http_retries "$HTTP_RETRIES" \
+#   --http_backoff "$HTTP_BACKOFF" \
+#   --pool_maxsize "$POOL_MAXSIZE" \
+#   --seed "$SEED" \
+#   --split_seed "$SPLIT_SEED"
