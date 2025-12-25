@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import random
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Set, Tuple
 
@@ -84,6 +85,41 @@ def select_eval_qids(
     rng.shuffle(eval_qids)
     n_valid = int(len(eval_qids) * valid_ratio)
     return eval_qids[:n_valid]
+
+
+def sample_qids_by_part(
+    qids: Sequence[str],
+    *,
+    qid_to_part: Dict[str, str] | None,
+    per_part: int,
+    seed: int,
+) -> List[str]:
+    """Sample a fixed number of qids from each dataset part.
+
+    Args:
+        qids: Candidate qids to sample from.
+        qid_to_part: Mapping from qid to part name.
+        per_part: Number of qids to sample per part; 0 or negative disables sampling.
+        seed: Seed for deterministic sampling.
+    """
+
+    if per_part <= 0 or not qid_to_part:
+        return list(qids)
+
+    rng = random.Random(seed)
+    by_part: Dict[str, List[str]] = defaultdict(list)
+    for qid in qids:
+        part = qid_to_part.get(qid, "unknown")
+        by_part[part].append(qid)
+
+    sampled: List[str] = []
+    for part, part_qids in by_part.items():
+        if len(part_qids) <= per_part:
+            sampled.extend(part_qids)
+        else:
+            sampled.extend(rng.sample(part_qids, per_part))
+
+    return sampled
 
 
 def _negatives_via_sampling(

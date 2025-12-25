@@ -36,6 +36,7 @@ from agent_rec.rerank_eval_utils import (
     metric_template,
     metrics_from_hits,
     prepare_eval_items,
+    sample_qids_by_part,
     select_eval_qids,
     topk_hits_from_scores,
 )
@@ -158,6 +159,12 @@ def main() -> None:
         seed=args.split_seed,
         valid_ratio=args.valid_ratio,
         qid_to_part=boot.bundle.qid_to_part,
+    )
+    eval_qids = sample_qids_by_part(
+        eval_qids,
+        qid_to_part=boot.bundle.qid_to_part,
+        per_part=200,
+        seed=args.seed,
     )
     agent_text_cache = build_agent_text_cache(boot.bundle.all_agents, boot.tools or {})
 
