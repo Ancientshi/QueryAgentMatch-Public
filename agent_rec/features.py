@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
+
 from dataclasses import dataclass
 import os
 import tempfile
@@ -20,125 +21,84 @@ except Exception as e:  # pragma: no cover - import error is user environment
 
 from .config import TFIDF_MAX_FEATURES
 
+UNK_LLM_TOKEN = "<UNK_LLM>"
+UNK_TOOL_TOKEN = "<UNK_TOOL>"
+
 
 @dataclass
 class FeatureCache:
     q_ids: List[str]
     a_ids: List[str]
     tool_names: List[str]
+    tool_id_vocab: List[str]
+    llm_ids: List[str]
+    llm_vocab: List[str]
     Q: np.ndarray
+    A_model_content: np.ndarray
+    A_tool_content: np.ndarray
     A_text_full: np.ndarray
+    agent_llm_idx: np.ndarray
     agent_tool_idx_padded: np.ndarray
     agent_tool_mask: np.ndarray
 
 
-def build_text_corpora(
-    all_agents: Dict[str, dict],
-    all_questions: Dict[str, dict],
-    tools: Dict[str, dict],
-) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]]]:
-    """Build text corpora aligned with simple_lightfm_agent_rec.py."""
-    q_ids = list(all_questions.keys())
-    q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
+def _tool_text(name: str, tools: Dict[str, dict]) -> str:
+    t = tools.get(name, {}) or {}
+    desc = t.get("description", "")
+    return f"{name} {desc}".strip()
 
-    tool_names = list(tools.keys())
 
-    def tool_text(name: str) -> str:
-        t = tools.get(name, {}) or {}
-        desc = t.get("description", "")
-        return f"{name} {desc}".strip()
-
-    tool_texts = [tool_text(name) for name in tool_names]
-
+def _extract_agent_fields(all_agents: Dict[str, dict]) -> Tuple[List[str], List[str], List[List[str]], List[str]]:
     a_ids = list(all_agents.keys())
-    a_texts: List[str] = []
-    a_tool_lists: List[List[str]] = []
+    model_names: List[str] = []
+    tool_lists: List[List[str]] = []
+    llm_ids: List[str] = []
     for aid in a_ids:
         a = all_agents.get(aid, {}) or {}
-        mname = ((a.get("M") or {}).get("name") or "").strip()
-        tool_list = ((a.get("T") or {}).get("tools") or [])
-        a_tool_lists.append(tool_list)
-        a_texts.append(mname)
-
-    return q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists
-
-
-def build_twotower_text_corpora(
-    all_agents: Dict[str, dict],
-    all_questions: Dict[str, dict],
-    tools: Dict[str, dict],
-) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]]]:
-    """Build TF-IDF corpora for two-tower models with tool text appended to agent text."""
-    q_ids = list(all_questions.keys())
-    q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
-
-    tool_names = list(tools.keys())
-
-    def tool_text(name: str) -> str:
-        t = tools.get(name, {}) or {}
-        desc = t.get("description", "")
-        return f"{name} {desc}".strip()
-
-    tool_texts = [tool_text(name) for name in tool_names]
-
-    a_ids = list(all_agents.keys())
-    a_texts: List[str] = []
-    a_tool_lists: List[List[str]] = []
-    for aid in a_ids:
-        a = all_agents.get(aid, {}) or {}
-        mname = ((a.get("M") or {}).get("name") or "").strip()
-        tool_list = ((a.get("T") or {}).get("tools") or [])
-        a_tool_lists.append(tool_list)
-        tools_concat = " ".join(tool_text(name) for name in tool_list)
-        a_texts.append(f"{mname} {tools_concat}".strip())
-
-    return q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists
+        m = (a.get("M") or {}) if isinstance(a, dict) else {}
+        model_names.append((m.get("name") or "").strip())
+        tool_lists.append(((a.get("T") or {}).get("tools") or []))
+        llm_ids.append((m.get("id") or "").strip())
+    return a_ids, model_names, tool_lists, llm_ids
 
 
-def build_transformer_corpora(
-    all_agents: Dict[str, dict],
-    all_questions: Dict[str, dict],
-    tools: Dict[str, dict],
-) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[List[str]]]:
-    """Build transformer corpora with tool descriptions embedded in agent text."""
-    q_ids = list(all_questions.keys())
-    q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
-
-    tool_names = list(tools.keys())
-
-    def tool_text(name: str) -> str:
-        t = tools.get(name, {}) or {}
-        desc = t.get("description", "")
-        return f"{name} {desc}".strip()
-
-    a_ids = list(all_agents.keys())
-    a_texts: List[str] = []
-    a_tool_lists: List[List[str]] = []
-    for aid in a_ids:
-        a = all_agents.get(aid, {}) or {}
-        mname = ((a.get("M") or {}).get("name") or "").strip()
-        tool_list = ((a.get("T") or {}).get("tools") or [])
-        a_tool_lists.append(tool_list)
-        tools_concat = " ".join(tool_text(name) for name in tool_list)
-        a_texts.append(f"{mname} {tools_concat}".strip())
-
-    return q_ids, q_texts, tool_names, a_ids, a_texts, a_tool_lists
+def _build_llm_vocab(llm_ids: List[str]) -> List[str]:
+    vocab = [UNK_LLM_TOKEN]
+    for lid in llm_ids:
+        if lid and lid not in vocab:
+            vocab.append(lid)
+    return vocab
 
 
-def build_vectorizers(
-    q_texts: List[str],
-    tool_texts: List[str],
-    a_texts: List[str],
-    max_features: int,
-) -> Tuple[TfidfVectorizer, TfidfVectorizer, TfidfVectorizer, "sp.csr_matrix", "sp.csr_matrix", "sp.csr_matrix"]:
-    q_vec = TfidfVectorizer(max_features=max_features, lowercase=True)
-    tool_vec = TfidfVectorizer(max_features=max_features, lowercase=True)
-    a_vec = TfidfVectorizer(max_features=max_features, lowercase=True)
+def _build_tool_vocab(tool_names: List[str]) -> List[str]:
+    return [UNK_TOOL_TOKEN] + list(tool_names)
 
-    Q = q_vec.fit_transform(q_texts)
-    Tm = tool_vec.fit_transform(tool_texts)
-    Am = a_vec.fit_transform(a_texts)
-    return q_vec, tool_vec, a_vec, Q, Tm, Am
+
+def _map_llm_ids(llm_ids: List[str], vocab_map: Dict[str, int]) -> np.ndarray:
+    unk = vocab_map.get(UNK_LLM_TOKEN, 0)
+    return np.array([vocab_map.get(lid, unk) for lid in llm_ids], dtype=np.int64)
+
+
+def build_agent_tool_id_buffers(
+    agent_tool_lists: List[List[str]],
+    tool_vocab_map: Dict[str, int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    unk_idx = tool_vocab_map.get(UNK_TOOL_TOKEN, 0)
+    num_agents = len(agent_tool_lists)
+    max_t = max([len(lst) for lst in agent_tool_lists]) if num_agents > 0 else 0
+    if max_t == 0:
+        max_t = 1
+    idx_pad = np.full((num_agents, max_t), unk_idx, dtype=np.int64)
+    mask = np.zeros((num_agents, max_t), dtype=np.float32)
+    for i, lst in enumerate(agent_tool_lists):
+        if not lst:
+            idx_pad[i, 0] = unk_idx
+            mask[i, 0] = 1.0
+            continue
+        for j, name in enumerate(lst[:max_t]):
+            idx_pad[i, j] = tool_vocab_map.get(name, unk_idx)
+            mask[i, j] = 1.0
+    return idx_pad, mask
 
 
 def agent_tool_text_matrix(
@@ -159,27 +119,36 @@ def agent_tool_text_matrix(
     return out
 
 
-def build_agent_tool_id_buffers(
-    a_ids: List[str],
-    agent_tool_lists: List[List[str]],
-    tool_names: List[str],
-) -> Tuple[np.ndarray, np.ndarray]:
-    t_map = {n: i for i, n in enumerate(tool_names)}
-    num_agents = len(a_ids)
-    max_t = max([len(lst) for lst in agent_tool_lists]) if num_agents > 0 else 0
-    if max_t == 0:
-        max_t = 1
-    idx_pad = np.zeros((num_agents, max_t), dtype=np.int64)
-    mask = np.zeros((num_agents, max_t), dtype=np.float32)
-    for i, lst in enumerate(agent_tool_lists):
-        for j, name in enumerate(lst[:max_t]):
-            if name in t_map:
-                idx_pad[i, j] = t_map[name]
-                mask[i, j] = 1.0
-    return idx_pad, mask
+def _base_corpora(
+    all_agents: Dict[str, dict],
+    all_questions: Dict[str, dict],
+    tools: Dict[str, dict],
+) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]], List[str]]:
+    q_ids = list(all_questions.keys())
+    q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
+
+    tool_names = list(tools.keys())
+    tool_texts = [_tool_text(name, tools) for name in tool_names]
+
+    a_ids, model_names, tool_lists, llm_ids = _extract_agent_fields(all_agents)
+    return q_ids, q_texts, tool_names, tool_texts, a_ids, model_names, tool_lists, llm_ids
 
 
-def build_twotower_feature_cache(
+def build_unified_corpora(
+    all_agents: Dict[str, dict],
+    all_questions: Dict[str, dict],
+    tools: Dict[str, dict],
+) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]], List[str]]:
+    """
+    Unified corpora builder for all models.
+
+    Returns (q_ids, q_texts, tool_names, tool_texts, a_ids, model_names, a_tool_lists, llm_ids)
+    so every model can construct agent content (model name + tool content) and ID (llm_id + tool ids) views consistently.
+    """
+    return _base_corpora(all_agents, all_questions, tools)
+
+
+def build_feature_cache(
     all_agents: Dict[str, dict],
     all_questions: Dict[str, dict],
     tools: Dict[str, dict],
@@ -191,59 +160,59 @@ def build_twotower_feature_cache(
         tool_names,
         tool_texts,
         a_ids,
-        a_texts,
+        model_names,
         a_tool_lists,
-    ) = build_twotower_text_corpora(all_agents, all_questions, tools)
+        llm_ids,
+    ) = _base_corpora(all_agents, all_questions, tools)
 
-    q_vec, tool_vec, a_vec, Q_csr, Tm_csr, Am_csr = build_vectorizers(
-        q_texts, tool_texts, a_texts, max_features
+    q_vec = TfidfVectorizer(max_features=max_features, lowercase=True)
+    tool_vec = TfidfVectorizer(max_features=max_features, lowercase=True)
+    model_vec = TfidfVectorizer(max_features=max_features, lowercase=True)
+
+    Q = q_vec.fit_transform(q_texts).toarray().astype(np.float32)
+    Tm_csr = tool_vec.fit_transform(tool_texts)
+    A_model_csr = model_vec.fit_transform(model_names)
+
+    A_model_content = A_model_csr.toarray().astype(np.float32)
+    A_tool_content = agent_tool_text_matrix(a_tool_lists, tool_names, Tm_csr)
+    A_text_full = np.concatenate([A_model_content, A_tool_content], axis=1).astype(np.float32)
+
+    tool_id_vocab = _build_tool_vocab(tool_names)
+    tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
+    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_tool_lists, tool_vocab_map)
+
+    llm_vocab = _build_llm_vocab(llm_ids)
+    llm_vocab_map = {n: i for i, n in enumerate(llm_vocab)}
+    agent_llm_idx = _map_llm_ids(llm_ids, llm_vocab_map)
+
+    return (
+        FeatureCache(
+            q_ids=q_ids,
+            a_ids=a_ids,
+            tool_names=tool_names,
+            tool_id_vocab=tool_id_vocab,
+            llm_ids=llm_ids,
+            llm_vocab=llm_vocab,
+            Q=Q,
+            A_model_content=A_model_content,
+            A_tool_content=A_tool_content,
+            A_text_full=A_text_full,
+            agent_llm_idx=agent_llm_idx,
+            agent_tool_idx_padded=agent_tool_idx_padded,
+            agent_tool_mask=agent_tool_mask,
+        ),
+        q_vec,
     )
 
-    Atool = agent_tool_text_matrix(a_tool_lists, tool_names, Tm_csr)
-    Am = Am_csr.toarray().astype(np.float32)
-    A_text_full = np.concatenate([Am, Atool], axis=1).astype(np.float32)
-    Q = Q_csr.toarray().astype(np.float32)
 
-    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
-    return FeatureCache(
-        q_ids=q_ids,
-        a_ids=a_ids,
-        tool_names=tool_names,
-        Q=Q,
-        A_text_full=A_text_full,
-        agent_tool_idx_padded=agent_tool_idx_padded,
-        agent_tool_mask=agent_tool_mask,
-    ), q_vec
-
-
-def build_feature_cache(
+# Backward-compatible alias with the unified agent content view
+def build_twotower_feature_cache(
     all_agents: Dict[str, dict],
     all_questions: Dict[str, dict],
     tools: Dict[str, dict],
     max_features: int = TFIDF_MAX_FEATURES,
 ) -> Tuple[FeatureCache, TfidfVectorizer]:
-    q_ids, q_texts, tool_names, tool_texts, a_ids, a_texts, a_tool_lists = build_text_corpora(
-        all_agents, all_questions, tools
-    )
-    q_vec, tool_vec, a_vec, Q_csr, Tm_csr, Am_csr = build_vectorizers(
-        q_texts, tool_texts, a_texts, max_features
-    )
-
-    Atool = agent_tool_text_matrix(a_tool_lists, tool_names, Tm_csr)
-    Am = Am_csr.toarray().astype(np.float32)
-    A_text_full = np.concatenate([Am, Atool], axis=1).astype(np.float32)
-    Q = Q_csr.toarray().astype(np.float32)
-
-    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
-    return FeatureCache(
-        q_ids=q_ids,
-        a_ids=a_ids,
-        tool_names=tool_names,
-        Q=Q,
-        A_text_full=A_text_full,
-        agent_tool_idx_padded=agent_tool_idx_padded,
-        agent_tool_mask=agent_tool_mask,
-    ), q_vec
+    return build_feature_cache(all_agents, all_questions, tools, max_features=max_features)
 
 
 def save_feature_cache(cache_dir: str, cache: FeatureCache) -> None:
@@ -256,9 +225,15 @@ def save_feature_cache(cache_dir: str, cache: FeatureCache) -> None:
     dump_json("q_ids.json", cache.q_ids)
     dump_json("a_ids.json", cache.a_ids)
     dump_json("tool_names.json", cache.tool_names)
+    dump_json("tool_id_vocab.json", cache.tool_id_vocab)
+    dump_json("llm_ids.json", cache.llm_ids)
+    dump_json("llm_vocab.json", cache.llm_vocab)
 
     np.save(f"{cache_dir}/Q.npy", cache.Q.astype(np.float32))
+    np.save(f"{cache_dir}/A_model_content.npy", cache.A_model_content.astype(np.float32))
+    np.save(f"{cache_dir}/A_tool_content.npy", cache.A_tool_content.astype(np.float32))
     np.save(f"{cache_dir}/A_text_full.npy", cache.A_text_full.astype(np.float32))
+    np.save(f"{cache_dir}/agent_llm_idx.npy", cache.agent_llm_idx.astype(np.int64))
     np.save(f"{cache_dir}/agent_tool_idx_padded.npy", cache.agent_tool_idx_padded.astype(np.int64))
     np.save(f"{cache_dir}/agent_tool_mask.npy", cache.agent_tool_mask.astype(np.float32))
 
@@ -290,9 +265,18 @@ def load_feature_cache(cache_dir: str) -> FeatureCache:
         a_ids = json.load(f)
     with open(f"{cache_dir}/tool_names.json", "r", encoding="utf-8") as f:
         tool_names = json.load(f)
+    with open(f"{cache_dir}/tool_id_vocab.json", "r", encoding="utf-8") as f:
+        tool_id_vocab = json.load(f)
+    with open(f"{cache_dir}/llm_ids.json", "r", encoding="utf-8") as f:
+        llm_ids = json.load(f)
+    with open(f"{cache_dir}/llm_vocab.json", "r", encoding="utf-8") as f:
+        llm_vocab = json.load(f)
 
     Q = np.load(f"{cache_dir}/Q.npy")
+    A_model_content = np.load(f"{cache_dir}/A_model_content.npy")
+    A_tool_content = np.load(f"{cache_dir}/A_tool_content.npy")
     A_text_full = np.load(f"{cache_dir}/A_text_full.npy")
+    agent_llm_idx = np.load(f"{cache_dir}/agent_llm_idx.npy")
     agent_tool_idx_padded = np.load(f"{cache_dir}/agent_tool_idx_padded.npy")
     agent_tool_mask = np.load(f"{cache_dir}/agent_tool_mask.npy")
 
@@ -300,8 +284,14 @@ def load_feature_cache(cache_dir: str) -> FeatureCache:
         q_ids=q_ids,
         a_ids=a_ids,
         tool_names=tool_names,
+        tool_id_vocab=tool_id_vocab,
+        llm_ids=llm_ids,
+        llm_vocab=llm_vocab,
         Q=Q,
+        A_model_content=A_model_content,
+        A_tool_content=A_tool_content,
         A_text_full=A_text_full,
+        agent_llm_idx=agent_llm_idx,
         agent_tool_idx_padded=agent_tool_idx_padded,
         agent_tool_mask=agent_tool_mask,
     )
@@ -314,8 +304,14 @@ def feature_cache_exists(cache_dir: str) -> bool:
         "q_ids.json",
         "a_ids.json",
         "tool_names.json",
+        "tool_id_vocab.json",
+        "llm_ids.json",
+        "llm_vocab.json",
         "Q.npy",
+        "A_model_content.npy",
+        "A_tool_content.npy",
         "A_text_full.npy",
+        "agent_llm_idx.npy",
         "agent_tool_idx_padded.npy",
         "agent_tool_mask.npy",
     ]
@@ -453,9 +449,10 @@ def build_twotower_bge_feature_cache(
         tool_names,
         tool_texts,
         a_ids,
-        a_texts,
+        model_names,
         a_tool_lists,
-    ) = build_twotower_text_corpora(all_agents, all_questions, tools)
+        llm_ids,
+    ) = _base_corpora(all_agents, all_questions, tools)
 
     Q = batch_embed(q_texts, embed_url, embed_batch, desc="Embedding questions", use_memmap=use_memmap)
     Q = l2_normalize(Q)
@@ -463,25 +460,37 @@ def build_twotower_bge_feature_cache(
     ToolE = batch_embed(tool_texts, embed_url, embed_batch, desc="Embedding tools", use_memmap=use_memmap)
     ToolE = l2_normalize(ToolE)
 
-    A_text_emb = batch_embed(
-        a_texts, embed_url, embed_batch, desc="Embedding agents (text)", use_memmap=use_memmap
+    A_model_emb = batch_embed(
+        model_names, embed_url, embed_batch, desc="Embedding agents (model name)", use_memmap=use_memmap
     )
-    A_text_emb = l2_normalize(A_text_emb)
+    A_model_emb = l2_normalize(A_model_emb)
 
     A_tool_emb = agent_tool_text_matrix_bge(a_tool_lists, tool_names, ToolE)
     if A_tool_emb.size > 0:
         A_tool_emb = l2_normalize(A_tool_emb)
 
-    A_text_full = np.concatenate([A_text_emb, A_tool_emb], axis=1).astype(np.float32)
+    A_text_full = np.concatenate([A_model_emb, A_tool_emb], axis=1).astype(np.float32)
 
-    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
+    tool_id_vocab = _build_tool_vocab(tool_names)
+    tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
+    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_tool_lists, tool_vocab_map)
+
+    llm_vocab = _build_llm_vocab(llm_ids)
+    llm_vocab_map = {n: i for i, n in enumerate(llm_vocab)}
+    agent_llm_idx = _map_llm_ids(llm_ids, llm_vocab_map)
 
     return FeatureCache(
         q_ids=q_ids,
         a_ids=a_ids,
         tool_names=tool_names,
+        tool_id_vocab=tool_id_vocab,
+        llm_ids=llm_ids,
+        llm_vocab=llm_vocab,
         Q=Q.astype(np.float32),
+        A_model_content=A_model_emb.astype(np.float32),
+        A_tool_content=A_tool_emb.astype(np.float32),
         A_text_full=A_text_full.astype(np.float32),
+        agent_llm_idx=agent_llm_idx,
         agent_tool_idx_padded=agent_tool_idx_padded,
         agent_tool_mask=agent_tool_mask,
     )

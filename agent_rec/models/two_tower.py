@@ -19,12 +19,14 @@ class TwoTowerTFIDF(RecommenderBase):
         d_q: int,
         d_a: int,
         num_tools: int,
+        num_llm_ids: int,
         agent_tool_idx_padded: torch.LongTensor,
         agent_tool_mask: torch.FloatTensor,
+        agent_llm_idx: torch.LongTensor,
         hid: int = 256,
         tool_emb: bool = True,
+        llm_id_emb: bool = False,
         num_agents: int = 0,
-        use_agent_id_emb: bool = False,
         num_queries: int = 0,
         use_query_id_emb: bool = False,
         export_batch_size: int = 4096,
@@ -40,12 +42,12 @@ class TwoTowerTFIDF(RecommenderBase):
         else:
             self.emb_tool = None
 
-        self.use_agent_id_emb = bool(use_agent_id_emb) and num_agents > 0
-        if self.use_agent_id_emb:
-            self.emb_agent = nn.Embedding(num_agents, hid)
-            nn.init.xavier_uniform_(self.emb_agent.weight)
+        self.use_llm_id_emb = bool(llm_id_emb) and num_llm_ids > 0
+        if self.use_llm_id_emb:
+            self.emb_llm = nn.Embedding(num_llm_ids, hid)
+            nn.init.xavier_uniform_(self.emb_llm.weight)
         else:
-            self.emb_agent = None
+            self.emb_llm = None
 
         self.use_query_id_emb = bool(use_query_id_emb) and num_queries > 0
         if self.use_query_id_emb:
@@ -56,9 +58,10 @@ class TwoTowerTFIDF(RecommenderBase):
 
         self.register_buffer("tool_idx", agent_tool_idx_padded.long())
         self.register_buffer("tool_mask", agent_tool_mask.float())
+        self.register_buffer("llm_idx", agent_llm_idx.long())
 
         combine_q_dim = hid + (hid if self.use_query_id_emb else 0)
-        combine_a_dim = hid + (hid if self.use_tool_emb else 0) + (hid if self.use_agent_id_emb else 0)
+        combine_a_dim = hid + (hid if self.use_tool_emb else 0) + (hid if self.use_llm_id_emb else 0)
         self.q_head = nn.Linear(combine_q_dim, hid)
         self.a_head = nn.Linear(combine_a_dim, hid)
 
@@ -99,8 +102,8 @@ class TwoTowerTFIDF(RecommenderBase):
         parts = [self.a_proj(a_vec)]
         if self.use_tool_emb:
             parts.append(self.tool_agg(agent_idx))
-        if self.use_agent_id_emb:
-            parts.append(self.emb_agent(agent_idx))
+        if self.use_llm_id_emb:
+            parts.append(self.emb_llm(self.llm_idx[agent_idx]))
         ah = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
         ah = self.a_head(ah)
         return F.normalize(ah, dim=-1)
@@ -154,7 +157,7 @@ class TwoTowerTFIDF(RecommenderBase):
     def extra_state_dict(self) -> Dict[str, Any]:
         return {
             "use_tool_emb": self.use_tool_emb,
-            "use_agent_id_emb": self.use_agent_id_emb,
+            "use_llm_id_emb": self.use_llm_id_emb,
             "use_query_id_emb": self.use_query_id_emb,
             "export_batch_size": self.export_batch_size,
         }

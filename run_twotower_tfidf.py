@@ -274,13 +274,15 @@ def main() -> None:
     encoder = TwoTowerTFIDF(
         d_q=int(Q_cpu.shape[1]),
         d_a=int(A_cpu.shape[1]),
-        num_tools=int(len(feature_cache.tool_names)),
+        num_tools=int(len(feature_cache.tool_id_vocab)),
+        num_llm_ids=int(len(feature_cache.llm_vocab)),
         agent_tool_idx_padded=torch.tensor(tool_ids_np, dtype=torch.long, device=device),
         agent_tool_mask=torch.tensor(tool_mask_np, dtype=torch.float32, device=device),
+        agent_llm_idx=torch.tensor(feature_cache.agent_llm_idx, dtype=torch.long, device=device),
         hid=args.hid,
         tool_emb=bool(args.use_tool_emb),
+        llm_id_emb=bool(args.use_agent_id_emb),
         num_agents=len(a_ids),
-        use_agent_id_emb=bool(args.use_agent_id_emb),
         num_queries=len(q_ids),
         use_query_id_emb=bool(args.use_query_id_emb),
     ).to(device)
@@ -345,12 +347,12 @@ def main() -> None:
             "d_q": int(Q_cpu.shape[1]),
             "d_a": int(A_cpu.shape[1]),
             "hid": int(args.hid),
-            "num_tools": int(len(feature_cache.tool_names)),
+            "num_tools": int(len(feature_cache.tool_id_vocab)),
             "num_agents": int(len(a_ids)),
         },
         "flags": {
             "use_tool_emb": bool(args.use_tool_emb),
-            "use_agent_id_emb": bool(args.use_agent_id_emb),
+            "use_llm_id_emb": bool(args.use_agent_id_emb),
         },
         "mappings": {"q_ids": q_ids, "a_ids": a_ids, "tool_names": feature_cache.tool_names},
     }

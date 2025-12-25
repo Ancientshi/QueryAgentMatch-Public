@@ -15,19 +15,31 @@ def bpr_loss(pos: torch.Tensor, neg: torch.Tensor) -> torch.Tensor:
 
 
 class BPRMF(RecommenderBase):
-    def __init__(self, num_q: int, num_a: int, factors: int = 128, add_bias: bool = True):
+    def __init__(
+        self,
+        num_q: int,
+        num_a: int,
+        num_llm_ids: int,
+        agent_llm_idx: torch.LongTensor,
+        factors: int = 128,
+        add_bias: bool = True,
+        use_llm_id_emb: bool = True,
+    ):
         super().__init__()
+        self.use_llm_id_emb = bool(use_llm_id_emb) and num_llm_ids > 0
         self.emb_q = nn.Embedding(num_q, factors)
-        self.emb_a = nn.Embedding(num_a, factors)
+        self.emb_llm = nn.Embedding(num_llm_ids, factors) if self.use_llm_id_emb else None
         self.add_bias = add_bias
         if add_bias:
             self.bias_q = nn.Embedding(num_q, 1)
             self.bias_a = nn.Embedding(num_a, 1)
+        self.register_buffer("agent_llm_idx", agent_llm_idx)
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.emb_q.weight)
-        nn.init.xavier_uniform_(self.emb_a.weight)
+        if self.emb_llm is not None:
+            nn.init.xavier_uniform_(self.emb_llm.weight)
         if self.add_bias:
             nn.init.zeros_(self.bias_q.weight)
             nn.init.zeros_(self.bias_a.weight)
@@ -51,15 +63,23 @@ class BPRMF(RecommenderBase):
         neg_idx: torch.LongTensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         qv = self.emb_q(q_idx)
-        apv = self.emb_a(pos_idx)
-        anv = self.emb_a(neg_idx)
+        if not self.use_llm_id_emb:
+            zero = torch.zeros((q_idx.size(0), self.emb_q.embedding_dim), device=q_idx.device)
+            apv = zero
+            anv = zero
+        else:
+            apv = self.emb_llm[self.agent_llm_idx[pos_idx]]
+            anv = self.emb_llm[self.agent_llm_idx[neg_idx]]
         pos = self.score_embeddings(qv, apv, q_idx, pos_idx)
         neg = self.score_embeddings(qv, anv, q_idx, neg_idx)
         return pos, neg
 
     # ---- RecommenderBase ----
     def export_agent_embeddings(self) -> np.ndarray:
-        return self.emb_a.weight.detach().cpu().numpy().astype(np.float32)
+        if not self.use_llm_id_emb:
+            return np.zeros((self.agent_llm_idx.numel(), self.emb_q.embedding_dim), dtype=np.float32)
+        embs = self.emb_llm.weight.detach().cpu().numpy().astype(np.float32)
+        return embs[self.agent_llm_idx.cpu().numpy()]
 
     def export_query_embeddings(self, q_indices: Sequence[int]) -> np.ndarray:
         w = self.emb_q.weight.detach().cpu().numpy().astype(np.float32)

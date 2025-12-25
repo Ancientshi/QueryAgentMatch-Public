@@ -68,6 +68,7 @@ class LightFM(RecommenderBase):
         self,
         num_q: int,
         num_a: int,
+        num_llm_ids: int,
         num_user_feats: int,
         num_item_feats: int,
         num_tool_ids: int = 0,
@@ -77,16 +78,19 @@ class LightFM(RecommenderBase):
         alpha_feat: float = 1.0,
         alpha_tool: float = 1.0,
         device: torch.device = torch.device("cpu"),
+        agent_llm_idx: Optional[torch.LongTensor] = None,
+        use_llm_id_emb: bool = True,
     ):
         super().__init__()
         self.add_bias = add_bias
         self.alpha_id = nn.Parameter(torch.tensor(alpha_id, dtype=torch.float32))
         self.alpha_feat = nn.Parameter(torch.tensor(alpha_feat, dtype=torch.float32))
         self.alpha_tool = nn.Parameter(torch.tensor(alpha_tool, dtype=torch.float32))
+        self.use_llm_id_emb = bool(use_llm_id_emb) and num_llm_ids > 0
         self.use_tool_id_emb = num_tool_ids > 0
 
         self.emb_q = nn.Embedding(num_q, factors)
-        self.emb_a = nn.Embedding(num_a, factors)
+        self.emb_llm = nn.Embedding(num_llm_ids, factors) if self.use_llm_id_emb else None
         self.emb_user_feat = nn.EmbeddingBag(num_user_feats, factors, mode="sum", include_last_offset=True)
         self.emb_item_feat = nn.EmbeddingBag(num_item_feats, factors, mode="sum", include_last_offset=True)
         if self.use_tool_id_emb:
@@ -103,12 +107,17 @@ class LightFM(RecommenderBase):
         self.user_vals_per_row: Optional[List[List[float]]] = None
         self.item_feats_per_row: Optional[List[List[int]]] = None
         self.item_vals_per_row: Optional[List[List[float]]] = None
+        if agent_llm_idx is not None:
+            self.register_buffer("agent_llm_idx", agent_llm_idx)
+        else:
+            self.agent_llm_idx = None
         self.item_tool_ids: Optional[torch.LongTensor] = None
         self.item_tool_mask: Optional[torch.FloatTensor] = None
 
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.emb_q.weight)
-        nn.init.xavier_uniform_(self.emb_a.weight)
+        if self.emb_llm is not None:
+            nn.init.xavier_uniform_(self.emb_llm.weight)
         nn.init.xavier_uniform_(self.emb_user_feat.weight)
         nn.init.xavier_uniform_(self.emb_item_feat.weight)
         if self.use_tool_id_emb:
@@ -170,7 +179,12 @@ class LightFM(RecommenderBase):
         return self.alpha_id * u_id + self.alpha_feat * u_feat
 
     def item_repr_batch(self, a_idx: torch.LongTensor) -> torch.Tensor:
-        i_id = self.emb_a(a_idx)
+        if self.use_llm_id_emb:
+            if self.agent_llm_idx is None:
+                raise RuntimeError("agent_llm_idx buffer not set.")
+            i_id = self.emb_llm(self.agent_llm_idx[a_idx])
+        else:
+            i_id = torch.zeros((a_idx.size(0), self.emb_user_feat.embedding_dim), device=self.device)
         i_feat = self._bag_embed_items(a_idx)
         out = self.alpha_id * i_id + self.alpha_feat * i_feat
         if self.use_tool_id_emb:
@@ -221,4 +235,8 @@ class LightFM(RecommenderBase):
         return None
 
     def extra_state_dict(self) -> Dict[str, Any]:
-        return {"add_bias": bool(self.add_bias), "use_tool_id_emb": bool(self.use_tool_id_emb)}
+        return {
+            "add_bias": bool(self.add_bias),
+            "use_tool_id_emb": bool(self.use_tool_id_emb),
+            "use_llm_id_emb": bool(self.use_llm_id_emb),
+        }
