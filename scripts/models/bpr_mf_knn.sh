@@ -14,4 +14,4 @@ python "$SCRIPT_DIR/../../run_bpr_mf_knn.py" \
   --batch_size "$BATCH_SIZE" \
   --factors 128 --neg_per_pos "$NEG_PER_POS" \
   --knn_N "$KNN_N" --eval_cand_size "$EVAL_CAND_SIZE" --score_mode dot \
-  --exp_name "bpr_mf_knn${EXP_SUFFIX:+_$EXP_SUFFIX}"
+  --exp_name "bpr_mf_knn"

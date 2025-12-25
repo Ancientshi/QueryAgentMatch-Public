@@ -47,6 +47,7 @@ def main():
     )
 
     bundle = boot.bundle
+    tools = boot.tools
     all_agents = bundle.all_agents
     all_questions = bundle.all_questions
     all_rankings = bundle.all_rankings

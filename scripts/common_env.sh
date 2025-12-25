@@ -1,19 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cross-model defaults. Override via environment variables when launching a script.
-# Track whether callers explicitly set key knobs so model scripts can decide
-# whether to substitute their own tuned defaults.
-USER_SET_EPOCHS="${EPOCHS+1}"
-USER_SET_BATCH_SIZE="${BATCH_SIZE+1}"
-
-DATA_ROOT="${DATA_ROOT:-/path/to/dataset_root}"
+DATA_ROOT="${DATA_ROOT:-/home/yunxshi/Data/workspace/QueryAgentMatch/QueryAgentMatch-Public/dataset}"
 DEVICE="${DEVICE:-cuda:0}"
-EPOCHS="${EPOCHS:-5}"
-BATCH_SIZE="${BATCH_SIZE:-256}"
 EXP_SUFFIX="${EXP_SUFFIX:-}"
 
-# Log the current configuration for reproducibility.
-log_cfg() {
-  echo "[cfg] DATA_ROOT=$DATA_ROOT DEVICE=$DEVICE EPOCHS=$EPOCHS BATCH_SIZE=$BATCH_SIZE EXP_SUFFIX=$EXP_SUFFIX $*"
-}
+NEG_PER_POS="${NEG_PER_POS:-1}"
+KNN_N="${KNN_N:-3}"
+EVAL_CAND_SIZE="${EVAL_CAND_SIZE:-1000}"

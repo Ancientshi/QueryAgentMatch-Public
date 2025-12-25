@@ -62,14 +62,26 @@ class BPRMF(RecommenderBase):
         pos_idx: torch.LongTensor,
         neg_idx: torch.LongTensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # ensure long + same device
+        q_idx = q_idx.long()
+        pos_idx = pos_idx.long()
+        neg_idx = neg_idx.long()
+
         qv = self.emb_q(q_idx)
+
         if not self.use_llm_id_emb:
-            zero = torch.zeros((q_idx.size(0), self.emb_q.embedding_dim), device=q_idx.device)
+            zero = torch.zeros((q_idx.size(0), self.emb_q.embedding_dim), device=q_idx.device, dtype=qv.dtype)
             apv = zero
             anv = zero
         else:
-            apv = self.emb_llm[self.agent_llm_idx[pos_idx]]
-            anv = self.emb_llm[self.agent_llm_idx[neg_idx]]
+            # agent -> llm id index
+            pos_llm_idx = self.agent_llm_idx[pos_idx].long()
+            neg_llm_idx = self.agent_llm_idx[neg_idx].long()
+
+            # FIX: Embedding is called, not subscripted
+            apv = self.emb_llm(pos_llm_idx)
+            anv = self.emb_llm(neg_llm_idx)
+
         pos = self.score_embeddings(qv, apv, q_idx, pos_idx)
         neg = self.score_embeddings(qv, anv, q_idx, neg_idx)
         return pos, neg
