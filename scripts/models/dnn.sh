@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../common_env.sh"
 
-EPOCHS=5
+EPOCHS=3
 BATCH_SIZE=4096
 LR=1e-3
 

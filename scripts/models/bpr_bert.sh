@@ -4,26 +4,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../common_env.sh"
 
-RUN_EPOCHS="$EPOCHS"
-RUN_BATCH_SIZE="$BATCH_SIZE"
-if [[ -z "${USER_SET_EPOCHS}" ]]; then
-  RUN_EPOCHS=3
-fi
-if [[ -z "${USER_SET_BATCH_SIZE}" ]]; then
-  RUN_BATCH_SIZE=256
-fi
-EPOCHS="$RUN_EPOCHS"
-BATCH_SIZE="$RUN_BATCH_SIZE"
+EPOCHS=3
+BATCH_SIZE=256
+LR=1e-3
 
-TUNE_MODE="${TUNE_MODE:-lora}"
+TUNE_MODE="${TUNE_MODE:-frozen}"
 UNFREEZE_LAST_N="${UNFREEZE_LAST_N:-2}"
 UNFREEZE_EMB="${UNFREEZE_EMB:-1}"
 GRAD_CKPT="${GRAD_CKPT:-0}"
 POOLING="${POOLING:-cls}"
 MAX_LEN="${MAX_LEN:-128}"
 TEXT_HIDDEN="${TEXT_HIDDEN:-256}"
-ID_DIM="${ID_DIM:-32}"
-NEG_PER_POS="${NEG_PER_POS:-1}"
 TOPK="${TOPK:-10}"
 PRETRAINED_MODEL="${PRETRAINED_MODEL:-distilbert-base-uncased}"
 ENCODER_LR="${ENCODER_LR:-5e-5}"
@@ -32,15 +23,14 @@ LORA_R="${LORA_R:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.1}"
 LORA_TARGETS="${LORA_TARGETS:-q_lin,k_lin,v_lin,out_lin}"
-USE_QUERY_ID_EMB="${USE_QUERY_ID_EMB:-0}"
 
-log_cfg "model=bpr_bert tune_mode=$TUNE_MODE pretrained_model=$PRETRAINED_MODEL pooling=$POOLING"
 
 python "$SCRIPT_DIR/../../run_bpr_bert.py" \
   --data_root "$DATA_ROOT" \
   --device "$DEVICE" \
-  --epochs "$RUN_EPOCHS" \
-  --batch_size "$RUN_BATCH_SIZE" \
+  --epochs "$EPOCHS" \
+  --batch_size "$BATCH_SIZE" \
+  --lr "$LR" \
   --pretrained_model "$PRETRAINED_MODEL" \
   --max_len "$MAX_LEN" \
   --text_hidden "$TEXT_HIDDEN" \
@@ -58,5 +48,9 @@ python "$SCRIPT_DIR/../../run_bpr_bert.py" \
   --lora_targets "$LORA_TARGETS" \
   --encoder_lr "$ENCODER_LR" \
   --encoder_weight_decay "$ENCODER_WEIGHT_DECAY" \
-  --use_query_id_emb "$USE_QUERY_ID_EMB" \
-  --exp_name "bpr_bert${EXP_SUFFIX:+_$EXP_SUFFIX}"
+  --use_query_id_emb 0 \
+  --use_llm_id_emb 1 \
+  --use_tool_id_emb 1 \
+  --use_model_content_vector 1 \
+  --use_tool_content_vector 1 \
+  --exp_name "bpr_bert_${TUNE_MODE}"

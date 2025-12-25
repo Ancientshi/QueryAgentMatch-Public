@@ -347,7 +347,6 @@ def main():
         data_root=args.data_root,
         exp_name=args.exp_name,
         topk=args.topk,
-        seed=1234,
         with_tools=True,
     )
 
@@ -836,7 +835,6 @@ def main():
         pos_topk_by_part=POS_TOPK_BY_PART,
         pos_topk_default=POS_TOPK,
         topk=int(args.topk),
-        seed=123,
         desc=f"Valid Overall (transformer, top{int(args.topk)})",
     )
     print_metrics_table("Validation Overall (transformer)", overall_metrics, ks=(int(args.topk),), filename=args.exp_name)
@@ -859,7 +857,6 @@ def main():
             pos_topk_by_part=POS_TOPK_BY_PART,
             pos_topk_default=POS_TOPK,
             topk=int(args.topk),
-            seed=123,
             desc=f"Valid {part} (transformer, top{int(args.topk)})",
         )
         print_metrics_table(

@@ -137,8 +137,8 @@ def build_agent_tool_id_buffers(
     mask = np.zeros((num_agents, max_t), dtype=np.float32)
     for i, lst in enumerate(agent_tool_lists):
         if not lst:
+            # Leave mask as zeros so padding/UNK slots are ignored in mean pooling.
             idx_pad[i, 0] = unk_idx
-            mask[i, 0] = 1.0
             continue
         for j, name in enumerate(lst[:max_t]):
             idx_pad[i, j] = tool_vocab_map.get(name, unk_idx)
