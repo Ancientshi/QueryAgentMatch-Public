@@ -351,10 +351,12 @@ class SimGCLRecommender(LightGCNRecommender):
         return base + self.perturb_eps * noise
 
     def contrastive_loss(self, z1: torch.Tensor, z2: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        # Only compute logits for the participating indices to keep memory usage bounded.
+        idx = idx.unique()
         z1 = F.normalize(z1[idx], dim=-1)
-        z2 = F.normalize(z2, dim=-1)
+        z2 = F.normalize(z2[idx], dim=-1)
         logits = z1 @ z2.T / self.temperature
-        labels = idx
+        labels = torch.arange(idx.numel(), device=logits.device)
         return F.cross_entropy(logits, labels)
 
     def forward(
@@ -379,8 +381,9 @@ class SimGCLRecommender(LightGCNRecommender):
         q_v1, a_v1 = view1[: self.num_q], view1[self.num_q :]
         q_v2, a_v2 = view2[: self.num_q], view2[self.num_q :]
 
-        cl_q = self.contrastive_loss(q_v1, q_v2, torch.arange(self.num_q, device=pos.device))
-        cl_a = self.contrastive_loss(a_v1, a_v2, torch.arange(self.num_a, device=pos.device))
+        cl_q = self.contrastive_loss(q_v1, q_v2, q_idx.to(pos.device))
+        agent_idx = torch.cat([pos_idx, neg_idx]).to(pos.device)
+        cl_a = self.contrastive_loss(a_v1, a_v2, agent_idx)
         cl_loss = 0.5 * (cl_q + cl_a)
         return pos, neg, cl_loss
 
