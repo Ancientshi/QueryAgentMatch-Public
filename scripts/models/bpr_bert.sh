@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../common_env.sh"
 
-EPOCHS=3
-BATCH_SIZE=256
+EPOCHS=2
+BATCH_SIZE=128
 LR=1e-3
+DEVICE="cuda:1"
 
-TUNE_MODE="${TUNE_MODE:-frozen}"
+TUNE_MODE="${TUNE_MODE:-lora}"
 UNFREEZE_LAST_N="${UNFREEZE_LAST_N:-2}"
 UNFREEZE_EMB="${UNFREEZE_EMB:-1}"
 GRAD_CKPT="${GRAD_CKPT:-0}"
