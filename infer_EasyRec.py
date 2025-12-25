@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 
@@ -187,10 +188,12 @@ def main() -> None:
 
     # 2) Threaded evaluation via HTTP
     agg = metric_template(ks)
+    part_aggs: Dict[str, Dict[int, Dict[str, float]]] = {}
+    part_counts = defaultdict(int)
     ref_k = 10 if 10 in ks else max(ks)
     lock = threading.Lock()
 
-    def _worker(it) -> Dict[int, Dict[str, float]]:
+    def _worker(it, part: str) -> Tuple[str, Dict[int, Dict[str, float]]]:
         scores = score_by_service(
             service_url=args.service_url,
             query_text=it.qtext,
@@ -202,16 +205,20 @@ def main() -> None:
             pool_maxsize=args.pool_maxsize,
         )
         _, bin_hits = topk_hits_from_scores(scores, it.cand_ids, it.rel_set, ks)
-        return metrics_from_hits(bin_hits, len(it.rel_set), ks)
+        return part, metrics_from_hits(bin_hits, len(it.rel_set), ks)
 
     with ThreadPoolExecutor(max_workers=args.max_workers) as ex, tqdm(
         total=len(items), desc="Evaluating (EasyRec HTTP)", dynamic_ncols=True
     ) as pbar:
-        futures = [ex.submit(_worker, it) for it in items]
+        futures = [ex.submit(_worker, it, boot.bundle.qid_to_part.get(it.qid, "Unknown")) for it in items]
         for done_idx, fut in enumerate(as_completed(futures), start=1):
-            res = fut.result()
+            part, res = fut.result()
             with lock:
                 accumulate_metrics(agg, res, ks)
+                if part not in part_aggs:
+                    part_aggs[part] = metric_template(ks)
+                accumulate_metrics(part_aggs[part], res, ks)
+                part_counts[part] += 1
             ref = agg[ref_k]
             pbar.update(1)
             pbar.set_postfix(
@@ -225,6 +232,21 @@ def main() -> None:
 
     metrics = finalize_metrics(agg, len(items), ks)
     print_metrics_table("EasyRec HTTP eval", metrics, ks=ks, filename=args.exp_name)
+    seen_parts = {"PartI", "PartII", "PartIII"}
+    for part in ["PartI", "PartII", "PartIII"]:
+        cnt = part_counts.get(part, 0)
+        if cnt <= 0:
+            continue
+        m_part = finalize_metrics(part_aggs[part], cnt, ks)
+        print_metrics_table(f"EasyRec HTTP eval {part}", m_part, ks=ks, filename=args.exp_name)
+    for part in sorted(part_aggs):
+        if part in seen_parts:
+            continue
+        cnt = part_counts.get(part, 0)
+        if cnt <= 0:
+            continue
+        m_part = finalize_metrics(part_aggs[part], cnt, ks)
+        print_metrics_table(f"EasyRec HTTP eval {part}", m_part, ks=ks, filename=args.exp_name)
 
 
 if __name__ == "__main__":

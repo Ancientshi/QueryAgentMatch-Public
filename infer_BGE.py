@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from typing import List, Tuple
+from collections import defaultdict
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -199,6 +200,8 @@ def main() -> None:
 
     # 3) Evaluation
     agg = metric_template(ks)
+    part_aggs: Dict[str, Dict[int, Dict[str, float]]] = {}
+    part_counts = defaultdict(int)
     ref_k = 10 if 10 in ks else max(ks)
     use_amp = bool(args.use_amp)
 
@@ -217,6 +220,11 @@ def main() -> None:
         _, bin_hits = topk_hits_from_scores(scores, it.cand_ids, it.rel_set, ks)
         per_k = metrics_from_hits(bin_hits, len(it.rel_set), ks)
         accumulate_metrics(agg, per_k, ks)
+        part = boot.bundle.qid_to_part.get(it.qid, "Unknown")
+        if part not in part_aggs:
+            part_aggs[part] = metric_template(ks)
+        accumulate_metrics(part_aggs[part], per_k, ks)
+        part_counts[part] += 1
 
         ref = agg[ref_k]
         pbar.set_postfix(
@@ -230,6 +238,21 @@ def main() -> None:
 
     metrics = finalize_metrics(agg, len(items), ks)
     print_metrics_table("BGE-Reranker eval", metrics, ks=ks, filename=args.exp_name)
+    seen_parts = {"PartI", "PartII", "PartIII"}
+    for part in ["PartI", "PartII", "PartIII"]:
+        cnt = part_counts.get(part, 0)
+        if cnt <= 0:
+            continue
+        m_part = finalize_metrics(part_aggs[part], cnt, ks)
+        print_metrics_table(f"BGE-Reranker eval {part}", m_part, ks=ks, filename=args.exp_name)
+    for part in sorted(part_aggs):
+        if part in seen_parts:
+            continue
+        cnt = part_counts.get(part, 0)
+        if cnt <= 0:
+            continue
+        m_part = finalize_metrics(part_aggs[part], cnt, ks)
+        print_metrics_table(f"BGE-Reranker eval {part}", m_part, ks=ks, filename=args.exp_name)
 
 
 if __name__ == "__main__":
