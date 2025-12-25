@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from .config import POS_TOPK, POS_TOPK_BY_PART, EVAL_TOPK
+from .config import EPS, POS_TOPK, POS_TOPK_BY_PART, EVAL_TOPK
 from .knn import knn_qvec_for_question_text
 from .scoring import score_candidates, ScoreMode
 from .models.base import RecommenderBase
@@ -63,16 +63,26 @@ def evaluate_sampled_knn_top10(
     score_mode: ScoreMode = "dot",
     seed: int = 123,
     desc: str = "Evaluating",
+    use_torch: bool = True,
 ) -> Dict[int, Dict[str, float]]:
     """
     Sampled eval with fixed top10:
       - candidates = positives ∪ random negatives to cand_size
       - qv via TF-IDF KNN weighted avg of train Q latent vectors
       - score on candidate subset
+      - optionally score via torch on the model device (GPU if available)
     Return format aligned with print_metrics_table: {10: {...}}
     """
     A = model.export_agent_embeddings()                  # (Na,F)
     bias_a = model.export_agent_bias()                   # (Na,) or None
+    device = next(model.parameters()).device
+
+    use_torch_backend = bool(use_torch and torch.cuda.is_available() and device.type == "cuda")
+    if use_torch_backend:
+        A_t = torch.from_numpy(A).to(device=device, non_blocking=True)
+        bias_t = torch.from_numpy(bias_a).to(device=device, non_blocking=True) if bias_a is not None else None
+    else:
+        bias_t = None
 
     all_agents = list(aid2idx.keys())
     all_agent_set = set(all_agents)
@@ -107,8 +117,30 @@ def evaluate_sampled_knn_top10(
         qv = knn_qvec_for_question_text(qtext, knn_cache, N=knn_N)  # (F,)
 
         ai_idx = np.array([aid2idx[a] for a in cand], dtype=np.int64)
-        s = score_candidates(A, qv, ai_idx, bias_a=bias_a, mode=score_mode)
-        order = np.argsort(-s)[:topk]
+
+        if use_torch_backend:
+            ai_idx_t = torch.from_numpy(ai_idx).to(device=device, non_blocking=True)
+            cand_emb = A_t.index_select(0, ai_idx_t)
+            qv_t = torch.from_numpy(qv).to(device=device, non_blocking=True)
+
+            if score_mode == "dot":
+                s_t = cand_emb @ qv_t
+            elif score_mode == "cosine":
+                cand_norm = torch.linalg.norm(cand_emb, dim=1, keepdim=True) + EPS
+                q_norm = torch.linalg.norm(qv_t) + EPS
+                s_t = (cand_emb / cand_norm) @ (qv_t / q_norm)
+            else:
+                raise ValueError(f"Unknown score mode: {score_mode}")
+
+            if bias_t is not None:
+                s_t = s_t + bias_t.index_select(0, ai_idx_t)
+
+            k_top = min(topk, s_t.numel())
+            order = torch.topk(s_t, k_top).indices.cpu().tolist()
+        else:
+            s = score_candidates(A, qv, ai_idx, bias_a=bias_a, mode=score_mode)
+            order = np.argsort(-s)[:topk].tolist()
+
         pred = [cand[i] for i in order]
 
         met = _metrics_at_k(pred, rel_set, topk)
