@@ -18,6 +18,7 @@ from typing import Dict, Iterable, List, Sequence, Set, Tuple
 import numpy as np
 
 from agent_rec.config import pos_topk_for_qid
+from agent_rec.data import stratified_train_valid_split
 
 
 @dataclass
@@ -54,8 +55,30 @@ def build_agent_text_cache(all_agents: Dict[str, dict], tools: Dict[str, dict]) 
     return cache
 
 
-def select_eval_qids(qids_in_rank: List[str], *, seed: int, valid_ratio: float = 0.2) -> List[str]:
-    """Shuffle qids deterministically and take the first `valid_ratio` portion."""
+def select_eval_qids(
+    qids_in_rank: List[str],
+    *,
+    seed: int,
+    valid_ratio: float = 0.2,
+    qid_to_part: Dict[str, str] | None = None,
+    stratified: bool = True,
+) -> List[str]:
+    """
+    Pick eval qids in a deterministic way.
+
+    If `qid_to_part` is provided (default for our datasets) and `stratified` is
+    True, this mirrors the training scripts' part-aware split so evaluation
+    uses the same distribution as the traditional models. Otherwise, it falls
+    back to a simple global shuffle.
+    """
+    if valid_ratio <= 0:
+        return list(qids_in_rank)
+    if stratified and qid_to_part:
+        _, valid_qids = stratified_train_valid_split(
+            list(qids_in_rank), qid_to_part=qid_to_part, valid_ratio=valid_ratio, seed=seed
+        )
+        return valid_qids
+
     rng = random.Random(seed)
     eval_qids = list(qids_in_rank)
     rng.shuffle(eval_qids)
