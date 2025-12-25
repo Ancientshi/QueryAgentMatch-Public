@@ -164,18 +164,47 @@ def agent_tool_text_matrix(
     return out
 
 
+def _reorder_ids(ids: List[str], desired_order: Optional[List[str]]) -> List[str]:
+    """
+    Return a deterministic ordering for IDs.
+
+    If `desired_order` is provided, ensure it matches the ID set and follow that order.
+    Otherwise, return the IDs sorted alphabetically.
+    """
+    if desired_order is None:
+        return sorted(ids)
+    ids_set = set(ids)
+    desired_set = set(desired_order)
+    if ids_set != desired_set:
+        missing = ids_set - desired_set
+        extra = desired_set - ids_set
+        raise ValueError(f"Desired ID order mismatch. missing={missing} extra={extra}")
+    return [i for i in desired_order if i in ids_set]
+
+
 def _base_corpora(
     all_agents: Dict[str, dict],
     all_questions: Dict[str, dict],
     tools: Dict[str, dict],
+    *,
+    q_id_order: Optional[List[str]] = None,
+    a_id_order: Optional[List[str]] = None,
+    tool_name_order: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]], List[str]]:
-    q_ids = list(all_questions.keys())
+    q_ids = _reorder_ids(list(all_questions.keys()), q_id_order)
     q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
 
-    tool_names = list(tools.keys())
+    tool_names = _reorder_ids(list(tools.keys()), tool_name_order)
     tool_texts = [_tool_text(name, tools) for name in tool_names]
 
-    a_ids, model_names, tool_lists, llm_ids = _extract_agent_fields(all_agents)
+    orig_a_ids, model_names_raw, tool_lists_raw, llm_ids_raw = _extract_agent_fields(all_agents)
+    a_ids = _reorder_ids(orig_a_ids, a_id_order)
+    model_map = dict(zip(orig_a_ids, model_names_raw))
+    tool_map = dict(zip(orig_a_ids, tool_lists_raw))
+    llm_map = dict(zip(orig_a_ids, llm_ids_raw))
+    model_names = [model_map[aid] for aid in a_ids]
+    tool_lists = [tool_map[aid] for aid in a_ids]
+    llm_ids = [llm_map[aid] for aid in a_ids]
     return q_ids, q_texts, tool_names, tool_texts, a_ids, model_names, tool_lists, llm_ids
 
 
@@ -183,14 +212,26 @@ def build_unified_corpora(
     all_agents: Dict[str, dict],
     all_questions: Dict[str, dict],
     tools: Dict[str, dict],
+    *,
+    q_id_order: Optional[List[str]] = None,
+    a_id_order: Optional[List[str]] = None,
+    tool_name_order: Optional[List[str]] = None,
 ) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str], List[List[str]], List[str]]:
     """
     Unified corpora builder for all models.
 
     Returns (q_ids, q_texts, tool_names, tool_texts, a_ids, model_names, a_tool_lists, llm_ids)
     so every model can construct agent content (model name + tool content) and ID (llm_id + tool ids) views consistently.
+    The optional *_order arguments enforce deterministic ordering (matching bootstrap-run id maps).
     """
-    return _base_corpora(all_agents, all_questions, tools)
+    return _base_corpora(
+        all_agents,
+        all_questions,
+        tools,
+        q_id_order=q_id_order,
+        a_id_order=a_id_order,
+        tool_name_order=tool_name_order,
+    )
 
 
 def build_feature_cache(
