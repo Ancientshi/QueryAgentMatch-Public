@@ -19,7 +19,12 @@ from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.eval import evaluate_sampled_embedding_topk, split_eval_qids_by_part
-from agent_rec.features import build_agent_tool_id_buffers, build_transformer_corpora
+from agent_rec.features import (
+    build_agent_tool_id_buffers,
+    build_unified_corpora,
+    UNK_TOOL_TOKEN,
+    UNK_LLM_TOKEN,
+)
 from agent_rec.models.dnn import SimpleBPRDNN, bpr_loss
 from agent_rec.run_common import (
     cache_key_from_meta,
@@ -43,10 +48,16 @@ def transformer_cache_exists(cache_dir: str) -> bool:
         "q_ids.json",
         "a_ids.json",
         "tool_names.json",
+        "tool_id_vocab.json",
+        "llm_ids.json",
+        "llm_vocab.json",
         "Q_emb.npy",
+        "A_model_content.npy",
+        "A_tool_content.npy",
         "A_emb.npy",
         "agent_tool_idx_padded.npy",
         "agent_tool_mask.npy",
+        "agent_llm_idx.npy",
         "enc_meta.json",
     ]
     return all(os.path.exists(os.path.join(cache_dir, name)) for name in needed)
@@ -57,10 +68,16 @@ def save_transformer_cache(
     q_ids,
     a_ids,
     tool_names,
+    tool_id_vocab,
+    llm_ids,
+    llm_vocab,
     Q_emb,
+    A_model_emb,
+    A_tool_emb,
     A_emb,
     agent_tool_idx_padded,
     agent_tool_mask,
+    agent_llm_idx,
     enc_meta,
 ):
     with open(os.path.join(cache_dir, "q_ids.json"), "w", encoding="utf-8") as f:
@@ -69,10 +86,19 @@ def save_transformer_cache(
         json.dump(a_ids, f, ensure_ascii=False)
     with open(os.path.join(cache_dir, "tool_names.json"), "w", encoding="utf-8") as f:
         json.dump(tool_names, f, ensure_ascii=False)
+    with open(os.path.join(cache_dir, "tool_id_vocab.json"), "w", encoding="utf-8") as f:
+        json.dump(tool_id_vocab, f, ensure_ascii=False)
+    with open(os.path.join(cache_dir, "llm_ids.json"), "w", encoding="utf-8") as f:
+        json.dump(llm_ids, f, ensure_ascii=False)
+    with open(os.path.join(cache_dir, "llm_vocab.json"), "w", encoding="utf-8") as f:
+        json.dump(llm_vocab, f, ensure_ascii=False)
     np.save(os.path.join(cache_dir, "Q_emb.npy"), Q_emb.astype(np.float32))
+    np.save(os.path.join(cache_dir, "A_model_content.npy"), A_model_emb.astype(np.float32))
+    np.save(os.path.join(cache_dir, "A_tool_content.npy"), A_tool_emb.astype(np.float32))
     np.save(os.path.join(cache_dir, "A_emb.npy"), A_emb.astype(np.float32))
     np.save(os.path.join(cache_dir, "agent_tool_idx_padded.npy"), agent_tool_idx_padded.astype(np.int64))
     np.save(os.path.join(cache_dir, "agent_tool_mask.npy"), agent_tool_mask.astype(np.float32))
+    np.save(os.path.join(cache_dir, "agent_llm_idx.npy"), agent_llm_idx.astype(np.int64))
     with open(os.path.join(cache_dir, "enc_meta.json"), "w", encoding="utf-8") as f:
         json.dump(enc_meta, f, ensure_ascii=False)
 
@@ -84,20 +110,35 @@ def load_transformer_cache(cache_dir: str):
         a_ids = json.load(f)
     with open(os.path.join(cache_dir, "tool_names.json"), "r", encoding="utf-8") as f:
         tool_names = json.load(f)
+    with open(os.path.join(cache_dir, "tool_id_vocab.json"), "r", encoding="utf-8") as f:
+        tool_id_vocab = json.load(f)
+    with open(os.path.join(cache_dir, "llm_ids.json"), "r", encoding="utf-8") as f:
+        llm_ids = json.load(f)
+    with open(os.path.join(cache_dir, "llm_vocab.json"), "r", encoding="utf-8") as f:
+        llm_vocab = json.load(f)
     with open(os.path.join(cache_dir, "enc_meta.json"), "r", encoding="utf-8") as f:
         enc_meta = json.load(f)
     Q_emb = np.load(os.path.join(cache_dir, "Q_emb.npy"))
+    A_model = np.load(os.path.join(cache_dir, "A_model_content.npy"))
+    A_tool = np.load(os.path.join(cache_dir, "A_tool_content.npy"))
     A_emb = np.load(os.path.join(cache_dir, "A_emb.npy"))
     agent_tool_idx_padded = np.load(os.path.join(cache_dir, "agent_tool_idx_padded.npy"))
     agent_tool_mask = np.load(os.path.join(cache_dir, "agent_tool_mask.npy"))
+    agent_llm_idx = np.load(os.path.join(cache_dir, "agent_llm_idx.npy"))
     return (
         q_ids,
         a_ids,
         tool_names,
+        tool_id_vocab,
+        llm_ids,
+        llm_vocab,
         Q_emb,
+        A_model,
+        A_tool,
         A_emb,
         agent_tool_idx_padded,
         agent_tool_mask,
+        agent_llm_idx,
         enc_meta,
     )
 
@@ -112,6 +153,9 @@ def encode_texts(
     batch_size: int = 256,
     pooling: str = "cls",
 ):
+    if not texts:
+        dim = getattr(getattr(encoder, "config", None), "hidden_size", 0) or 0
+        return np.zeros((0, dim), dtype=np.float32)
     embs = []
     use_cls = pooling == "cls"
     for i in tqdm(range(0, len(texts), batch_size), desc="Encoding with Transformer", dynamic_ncols=True):
@@ -133,6 +177,9 @@ def encode_texts(
 
 
 def encode_batch(tokenizer, encoder, texts: List[str], device, max_len: int = 128, pooling: str = "cls"):
+    if not texts:
+        dim = getattr(getattr(encoder, "config", None), "hidden_size", 0) or 0
+        return torch.zeros((0, dim), device=device)
     toks = tokenizer(texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
     toks = {k: v.to(device) for k, v in toks.items()}
     out = encoder(**toks)
@@ -302,18 +349,24 @@ def main():
         q_ids,
         q_texts,
         tool_names,
+        tool_texts,
         a_ids,
-        a_texts,
+        a_model_names,
         a_tool_lists,
-    ) = build_transformer_corpora(all_agents, all_questions, tools)
+        llm_ids,
+    ) = build_unified_corpora(all_agents, all_questions, tools)
     if q_ids != boot.q_ids or a_ids != boot.a_ids:
         raise ValueError("ID ordering mismatch between data bootstrap and transformer corpora.")
 
-    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(
-        a_ids, a_tool_lists, tool_names
-    )
+    tool_id_vocab = [UNK_TOOL_TOKEN] + tool_names
+    tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
+    agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_tool_lists, tool_vocab_map)
     agent_tool_idx_padded = torch.from_numpy(agent_tool_idx_padded).long()
     agent_tool_mask = torch.from_numpy(agent_tool_mask).float()
+    llm_vocab = [UNK_LLM_TOKEN] + [lid for lid in llm_ids if lid]
+    llm_vocab = list(dict.fromkeys(llm_vocab))
+    llm_vocab_map = {n: i for i, n in enumerate(llm_vocab)}
+    agent_llm_idx = torch.tensor([llm_vocab_map.get(lid, 0) for lid in llm_ids], dtype=torch.long)
 
     qid2idx = boot.qid2idx
     aid2idx = boot.aid2idx
@@ -404,7 +457,7 @@ def main():
             p.requires_grad = False
 
     use_embedding_cache = args.tune_mode == "frozen"
-    Q_emb = A_emb = None
+    Q_emb = A_emb = A_model_emb = A_tool_emb = None
 
     if use_embedding_cache:
         if transformer_cache_exists(transformer_cache_dir) and args.rebuild_embedding_cache == 0:
@@ -412,16 +465,25 @@ def main():
                 q_ids_c,
                 a_ids_c,
                 tool_names_c,
+                tool_id_vocab_c,
+                llm_ids_c,
+                llm_vocab_c,
                 Q_emb,
+                A_model_emb,
+                A_tool_emb,
                 A_emb,
                 agent_tool_idx_padded_np,
                 agent_tool_mask_np,
+                agent_llm_idx_np,
                 enc_meta,
             ) = load_transformer_cache(transformer_cache_dir)
             if (
                 q_ids_c == q_ids
                 and a_ids_c == a_ids
                 and tool_names_c == tool_names
+                and tool_id_vocab_c == tool_id_vocab
+                and llm_ids_c == llm_ids
+                and llm_vocab_c == llm_vocab
                 and enc_meta.get("pretrained_model") == args.pretrained_model
                 and enc_meta.get("max_len") == args.max_len
                 and enc_meta.get("pooling", "cls") == args.pooling
@@ -429,9 +491,10 @@ def main():
                 print(f"[cache] loaded transformer embeddings from {transformer_cache_dir}")
                 agent_tool_idx_padded = torch.from_numpy(agent_tool_idx_padded_np).long()
                 agent_tool_mask = torch.from_numpy(agent_tool_mask_np).float()
+                agent_llm_idx = torch.from_numpy(agent_llm_idx_np).long()
             else:
                 print("[cache] transformer cache mismatch; rebuilding embeddings...")
-                Q_emb = A_emb = None
+                Q_emb = A_emb = A_model_emb = A_tool_emb = None
 
         if Q_emb is None or A_emb is None:
             encoder.eval()
@@ -445,8 +508,8 @@ def main():
                     batch_size=256,
                     pooling=args.pooling,
                 )
-                A_emb = encode_texts(
-                    a_texts,
+                A_model_emb = encode_texts(
+                    a_model_names,
                     tokenizer,
                     encoder,
                     device,
@@ -454,17 +517,46 @@ def main():
                     batch_size=256,
                     pooling=args.pooling,
                 )
+                tool_emb = encode_texts(
+                    tool_texts,
+                    tokenizer,
+                    encoder,
+                    device,
+                    max_len=args.max_len,
+                    batch_size=256,
+                    pooling=args.pooling,
+                )
+                tool_emb = tool_emb / (np.linalg.norm(tool_emb, axis=1, keepdims=True) + 1e-8)
+                A_tool_emb = []
+                for tools_for_agent in a_tool_lists:
+                    if tools_for_agent:
+                        idxs = [tool_names.index(t) for t in tools_for_agent if t in tool_names]
+                        if idxs:
+                            A_tool_emb.append(tool_emb[idxs].mean(axis=0))
+                            continue
+                    A_tool_emb.append(np.zeros((tool_emb.shape[1],), dtype=np.float32))
+                A_tool_emb = np.stack(A_tool_emb, axis=0)
+                A_model_emb = A_model_emb / (np.linalg.norm(A_model_emb, axis=1, keepdims=True) + 1e-8)
+                if A_tool_emb.size > 0:
+                    A_tool_emb = A_tool_emb / (np.linalg.norm(A_tool_emb, axis=1, keepdims=True) + 1e-8)
+                A_emb = np.concatenate([A_model_emb, A_tool_emb], axis=1).astype(np.float32)
             save_transformer_cache(
                 transformer_cache_dir,
                 q_ids,
                 a_ids,
                 tool_names,
+                tool_id_vocab,
+                llm_ids,
+                llm_vocab,
                 Q_emb,
+                A_model_emb,
+                A_tool_emb,
                 A_emb,
                 agent_tool_idx_padded.cpu().numpy()
                 if torch.is_tensor(agent_tool_idx_padded)
                 else agent_tool_idx_padded,
                 agent_tool_mask.cpu().numpy() if torch.is_tensor(agent_tool_mask) else agent_tool_mask,
+                agent_llm_idx.cpu().numpy() if torch.is_tensor(agent_llm_idx) else agent_llm_idx,
                 enc_meta={
                     "pretrained_model": args.pretrained_model,
                     "max_len": args.max_len,
@@ -487,14 +579,17 @@ def main():
     model = SimpleBPRDNN(
         d_q=d_text,
         d_a=d_text,
-        num_agents=len(a_ids),
-        num_tools=len(tool_names),
+        num_tools=len(tool_id_vocab),
+        num_llm_ids=len(llm_vocab),
         agent_tool_indices_padded=agent_tool_idx_padded.to(device),
         agent_tool_mask=agent_tool_mask.to(device),
+        agent_llm_idx=agent_llm_idx.to(device),
         text_hidden=args.text_hidden,
         id_dim=args.id_dim,
         num_queries=len(q_ids),
         use_query_id_emb=bool(args.use_query_id_emb),
+        use_tool_id_emb=True,
+        use_llm_id_emb=True,
     ).to(device)
 
     head_params = list(model.parameters())
@@ -541,26 +636,51 @@ def main():
                 neg_vec = A_t[neg_idx]
             else:
                 uniq_q, inv_q = torch.unique(q_idx, sorted=True, return_inverse=True)
-                uniq_pos, inv_pos = torch.unique(pos_idx, sorted=True, return_inverse=True)
-                uniq_neg, inv_neg = torch.unique(neg_idx, sorted=True, return_inverse=True)
+                uniq_agents = torch.unique(torch.cat([pos_idx, neg_idx]), sorted=True)
 
                 q_text_batch = [q_texts[i] for i in uniq_q.tolist()]
-                pos_text_batch = [a_texts[i] for i in uniq_pos.tolist()]
-                neg_text_batch = [a_texts[i] for i in uniq_neg.tolist()]
-
                 q_vec_uniq = encode_batch(
                     tokenizer, encoder, q_text_batch, device, max_len=args.max_len, pooling=args.pooling
                 )
-                pos_vec_uniq = encode_batch(
-                    tokenizer, encoder, pos_text_batch, device, max_len=args.max_len, pooling=args.pooling
-                )
-                neg_vec_uniq = encode_batch(
-                    tokenizer, encoder, neg_text_batch, device, max_len=args.max_len, pooling=args.pooling
-                )
-
                 q_vec = q_vec_uniq[inv_q]
-                pos_vec = pos_vec_uniq[inv_pos]
-                neg_vec = neg_vec_uniq[inv_neg]
+
+                agent_texts = [a_model_names[i] for i in uniq_agents.tolist()]
+                model_emb = encode_batch(
+                    tokenizer, encoder, agent_texts, device, max_len=args.max_len, pooling=args.pooling
+                )
+                model_emb = F.normalize(model_emb, dim=-1)
+
+                needed_tools = []
+                for idx_agent in uniq_agents.tolist():
+                    needed_tools.extend([t for t in a_tool_lists[idx_agent]])
+                needed_tools = sorted(set(needed_tools))
+                tool_emb_map = {}
+                if needed_tools:
+                    names_in_vocab = [t for t in needed_tools if t in tool_names]
+                    tool_text_batch = [tool_texts[tool_names.index(t)] for t in names_in_vocab]
+                    if tool_text_batch:
+                        tool_emb_batch = encode_batch(
+                            tokenizer, encoder, tool_text_batch, device, max_len=args.max_len, pooling=args.pooling
+                        )
+                        tool_emb_batch = F.normalize(tool_emb_batch, dim=-1)
+                        for name, emb in zip(names_in_vocab, tool_emb_batch):
+                            tool_emb_map[name] = emb
+                tool_dim = model_emb.shape[1]
+                zero_tool = torch.zeros((tool_dim,), device=device)
+                tool_feats = []
+                for idx_agent in uniq_agents.tolist():
+                    names = [t for t in a_tool_lists[idx_agent] if t in tool_emb_map]
+                    if names:
+                        stacked = torch.stack([tool_emb_map[n] for n in names], dim=0)
+                        tool_feats.append(stacked.mean(dim=0))
+                    else:
+                        tool_feats.append(zero_tool)
+                tool_feats_t = torch.stack(tool_feats, dim=0)
+                tool_feats_t = F.normalize(tool_feats_t, dim=-1) if tool_feats_t.numel() > 0 else tool_feats_t
+                content_all = torch.cat([model_emb, tool_feats_t], dim=-1)
+                agent_order = uniq_agents.tolist()
+                pos_vec = content_all[[agent_order.index(i.item()) for i in pos_idx]]
+                neg_vec = content_all[[agent_order.index(i.item()) for i in neg_idx]]
 
             pos, neg = model(q_vec, pos_vec, neg_vec, pos_idx, neg_idx, q_idx=q_idx)
             loss = bpr_loss(pos, neg)
@@ -586,8 +706,17 @@ def main():
                 batch_size=256,
                 pooling=args.pooling,
             )
-            A_emb_eval = encode_texts(
-                a_texts,
+            A_model_eval = encode_texts(
+                a_model_names,
+                tokenizer,
+                encoder,
+                device,
+                max_len=args.max_len,
+                batch_size=256,
+                pooling=args.pooling,
+            )
+            tool_emb_eval = encode_texts(
+                tool_texts,
                 tokenizer,
                 encoder,
                 device,
@@ -596,6 +725,19 @@ def main():
                 pooling=args.pooling,
             )
         Q_t = torch.from_numpy(Q_emb_eval).to(device)
+        A_model_eval = A_model_eval / (np.linalg.norm(A_model_eval, axis=1, keepdims=True) + 1e-8)
+        tool_emb_eval = tool_emb_eval / (np.linalg.norm(tool_emb_eval, axis=1, keepdims=True) + 1e-8)
+        A_tool_eval = []
+        for tools_for_agent in a_tool_lists:
+            if tools_for_agent:
+                idxs = [tool_names.index(t) for t in tools_for_agent if t in tool_names]
+                if idxs:
+                    A_tool_eval.append(tool_emb_eval[idxs].mean(axis=0))
+                    continue
+            A_tool_eval.append(np.zeros((tool_emb_eval.shape[1],), dtype=np.float32))
+        A_tool_eval = np.stack(A_tool_eval, axis=0)
+        A_tool_eval = A_tool_eval / (np.linalg.norm(A_tool_eval, axis=1, keepdims=True) + 1e-8)
+        A_emb_eval = np.concatenate([A_model_eval, A_tool_eval], axis=1).astype(np.float32)
         A_t = torch.from_numpy(A_emb_eval).to(device)
 
     model_dir = os.path.join(exp_cache_dir, "models")
@@ -611,7 +753,8 @@ def main():
         "dims": {
             "d_text": int(Q_t.shape[1]),
             "num_agents": len(a_ids),
-            "num_tools": len(tool_names),
+            "num_tools": len(tool_id_vocab),
+            "num_llm_ids": len(llm_vocab),
             "text_hidden": args.text_hidden,
             "id_dim": args.id_dim,
         },

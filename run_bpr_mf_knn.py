@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
+from agent_rec.features import build_unified_corpora, UNK_LLM_TOKEN
 from agent_rec.knn import build_knn_cache, load_knn_cache
 from agent_rec.eval import evaluate_sampled_knn_top10, split_eval_qids_by_part
 from agent_rec.models.bpr_mf import BPRMF, bpr_loss
@@ -98,8 +99,22 @@ def main():
         build_cache,
     )
 
+    _, _, _, _, _, _, _, llm_ids = build_unified_corpora(all_agents, all_questions, tools or {})
+    llm_vocab = [UNK_LLM_TOKEN] + [lid for lid in llm_ids if lid]
+    llm_vocab = list(dict.fromkeys(llm_vocab))
+    llm_vocab_map = {n: i for i, n in enumerate(llm_vocab)}
+    agent_llm_idx = np.array([llm_vocab_map.get(lid, 0) for lid in llm_ids], dtype=np.int64)
+
     device = torch.device(args.device)
-    model = BPRMF(num_q=len(q_ids), num_a=len(a_ids), factors=args.factors, add_bias=True).to(device)
+    model = BPRMF(
+        num_q=len(q_ids),
+        num_a=len(a_ids),
+        num_llm_ids=len(llm_vocab),
+        agent_llm_idx=torch.tensor(agent_llm_idx, dtype=torch.long, device=device),
+        factors=args.factors,
+        add_bias=True,
+        use_llm_id_emb=True,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     pairs = pairs_idx_np.tolist()

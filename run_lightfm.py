@@ -20,13 +20,15 @@ from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
     build_agent_tool_id_buffers,
     build_feature_cache,
-    build_text_corpora,
+    build_unified_corpora,
     feature_cache_exists,
     load_feature_cache,
     load_q_vectorizer,
     normalize_features,
     save_feature_cache,
     save_q_vectorizer,
+    UNK_TOOL_TOKEN,
+    UNK_LLM_TOKEN,
 )
 from agent_rec.knn import build_knn_cache, build_knn_cache_with_vectorizer, load_knn_cache
 from agent_rec.eval import evaluate_sampled_knn_top10, split_eval_qids_by_part
@@ -102,7 +104,7 @@ def main():
             feature_cache = load_feature_cache(feature_cache_dir)
             q_vectorizer_runtime = load_q_vectorizer(feature_cache_dir)
             if q_vectorizer_runtime is None:
-                _, q_texts, _, _, _, _, _ = build_text_corpora(all_agents, all_questions, tools)
+                _, q_texts, _, _, _, _, _, _ = build_unified_corpora(all_agents, all_questions, tools)
                 q_vectorizer_runtime = TfidfVectorizer(
                     max_features=args.max_features, lowercase=True
                 ).fit(q_texts)
@@ -124,23 +126,25 @@ def main():
         feature_cache = None
         q_vectorizer_runtime = None
 
-    tool_id_buffers = None
-    if args.use_tool_id_emb:
-        if feature_cache is not None:
-            tool_id_buffers = (
-                feature_cache.agent_tool_idx_padded,
-                feature_cache.agent_tool_mask,
-            )
-        else:
-            _, _, _, _, _, _, a_tool_lists = build_text_corpora(all_agents, all_questions, tools)
-            tool_id_buffers = build_agent_tool_id_buffers(a_ids, a_tool_lists, tool_names)
-
     if feature_cache is None:
         Q_np = U.toarray().astype(np.float32)
         A_text_full_np = V.toarray().astype(np.float32)
+        _, _, _, _, _, _, a_tool_lists, llm_ids = build_unified_corpora(all_agents, all_questions, tools)
+        tool_id_vocab = [UNK_TOOL_TOKEN] + tool_names
+        tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
+        agent_tool_idx_padded, agent_tool_mask = build_agent_tool_id_buffers(a_tool_lists, tool_vocab_map)
+        llm_vocab = [UNK_LLM_TOKEN] + [lid for lid in llm_ids if lid]
+        llm_vocab = list(dict.fromkeys(llm_vocab))  # preserve order
+        llm_vocab_map = {n: i for i, n in enumerate(llm_vocab)}
+        agent_llm_idx = np.array([llm_vocab_map.get(lid, 0) for lid in llm_ids], dtype=np.int64)
     else:
         Q_np = feature_cache.Q.astype(np.float32)
         A_text_full_np = feature_cache.A_text_full.astype(np.float32)
+        agent_tool_idx_padded = feature_cache.agent_tool_idx_padded
+        agent_tool_mask = feature_cache.agent_tool_mask
+        tool_id_vocab = feature_cache.tool_id_vocab
+        llm_vocab = feature_cache.llm_vocab
+        agent_llm_idx = feature_cache.agent_llm_idx
 
     U_csr, V_csr = normalize_features(Q_np, A_text_full_np)
     print(f"[features] user_features: {U_csr.shape}, item_features: {V_csr.shape}")
@@ -189,22 +193,24 @@ def main():
     model = LightFM(
         num_q=len(q_ids),
         num_a=len(a_ids),
+        num_llm_ids=len(llm_vocab),
         num_user_feats=num_user_feats,
         num_item_feats=num_item_feats,
-        num_tool_ids=len(tool_names) if args.use_tool_id_emb else 0,
+        num_tool_ids=len(tool_id_vocab) if args.use_tool_id_emb else 0,
         factors=args.factors,
         add_bias=True,
         alpha_id=args.alpha_id,
         alpha_feat=args.alpha_feat,
         alpha_tool=args.alpha_tool,
         device=device,
+        agent_llm_idx=torch.tensor(agent_llm_idx, dtype=torch.long, device=device),
+        use_llm_id_emb=True,
     ).to(device)
     model.set_user_feat_lists(u_feats_per_row, u_vals_per_row)
     model.set_item_feat_lists(i_feats_per_row, i_vals_per_row)
-    if args.use_tool_id_emb and tool_id_buffers is not None:
-        tool_ids_np, tool_mask_np = tool_id_buffers
-        tool_ids = torch.tensor(tool_ids_np, dtype=torch.long, device=device)
-        tool_mask = torch.tensor(tool_mask_np, dtype=torch.float32, device=device)
+    if args.use_tool_id_emb:
+        tool_ids = torch.tensor(agent_tool_idx_padded, dtype=torch.long, device=device)
+        tool_mask = torch.tensor(agent_tool_mask, dtype=torch.float32, device=device)
         model.set_item_tool_id_buffers(tool_ids, tool_mask)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)

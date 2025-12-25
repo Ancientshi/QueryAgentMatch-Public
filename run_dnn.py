@@ -17,12 +17,15 @@ from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FE
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
     build_feature_cache,
-    build_text_corpora,
+    build_unified_corpora,
     feature_cache_exists,
     load_feature_cache,
     load_q_vectorizer,
     save_feature_cache,
     save_q_vectorizer,
+    UNK_TOOL_TOKEN,
+    UNK_LLM_TOKEN,
+    build_agent_tool_id_buffers,
 )
 from agent_rec.eval import evaluate_sampled_direct_top10, split_eval_qids_by_part
 from agent_rec.models.dnn import SimpleBPRDNN, bpr_loss
@@ -81,7 +84,7 @@ def main():
         feature_cache = load_feature_cache(feature_cache_dir)
         q_vectorizer_runtime = load_q_vectorizer(feature_cache_dir)
         if q_vectorizer_runtime is None:
-            _, q_texts, _, _, _, _, _ = build_text_corpora(all_agents, all_questions, tools)
+            _, q_texts, _, _, _, _, _, _ = build_unified_corpora(all_agents, all_questions, tools)
             from sklearn.feature_extraction.text import TfidfVectorizer
 
             q_vectorizer_runtime = TfidfVectorizer(
@@ -100,6 +103,7 @@ def main():
     A_text_full_np = feature_cache.A_text_full.astype(np.float32)
     tool_ids_np = feature_cache.agent_tool_idx_padded
     tool_mask_np = feature_cache.agent_tool_mask
+    llm_idx_np = feature_cache.agent_llm_idx
 
     want_meta = {
         "data_sig": data_sig,
@@ -142,14 +146,17 @@ def main():
     model = SimpleBPRDNN(
         d_q=int(Q_np.shape[1]),
         d_a=int(A_text_full_np.shape[1]),
-        num_agents=len(a_ids),
-        num_tools=len(tool_names),
+        num_tools=int(len(feature_cache.tool_id_vocab)),
+        num_llm_ids=int(len(feature_cache.llm_vocab)),
         agent_tool_indices_padded=torch.tensor(tool_ids_np, dtype=torch.long, device=device),
         agent_tool_mask=torch.tensor(tool_mask_np, dtype=torch.float32, device=device),
+        agent_llm_idx=torch.tensor(feature_cache.agent_llm_idx, dtype=torch.long, device=device),
         text_hidden=args.text_hidden,
         id_dim=args.id_dim,
         num_queries=len(q_ids),
         use_query_id_emb=bool(args.use_query_id_emb),
+        use_tool_id_emb=True,
+        use_llm_id_emb=True,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
