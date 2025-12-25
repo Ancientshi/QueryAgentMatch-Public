@@ -16,7 +16,7 @@ python "$SCRIPT_DIR/../../run_lightgcn.py" \
   --knn_N "$KNN_N" --eval_cand_size "$EVAL_CAND_SIZE" --score_mode dot \
   --use_query_id_emb 1 \
   --use_llm_id_emb 1 \
-  --use_tool_id_emb 0 \
+  --use_tool_id_emb 1 \
   --use_model_content_vector 1 \
   --use_tool_content_vector 1 \
   --exp_name "lightgcn"

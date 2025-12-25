@@ -127,10 +127,21 @@ def _map_llm_ids(llm_ids: List[str], vocab_map: Dict[str, int]) -> np.ndarray:
 def build_agent_tool_id_buffers(
     agent_tool_lists: List[List[str]],
     tool_vocab_map: Dict[str, int],
+    *,
+    max_tools_per_agent: Optional[int] = 8,
 ) -> Tuple[np.ndarray, np.ndarray]:
     unk_idx = tool_vocab_map.get(UNK_TOOL_TOKEN, 0)
     num_agents = len(agent_tool_lists)
-    max_t = max([len(lst) for lst in agent_tool_lists]) if num_agents > 0 else 0
+
+    if max_tools_per_agent is not None and max_tools_per_agent <= 0:
+        raise ValueError("max_tools_per_agent must be positive or None for unlimited")
+
+    max_len_from_data = max([len(lst) for lst in agent_tool_lists]) if num_agents > 0 else 0
+    if max_tools_per_agent is None:
+        max_t = max_len_from_data
+    else:
+        max_t = min(max_len_from_data, max_tools_per_agent)
+        
     if max_t == 0:
         max_t = 1
     idx_pad = np.full((num_agents, max_t), unk_idx, dtype=np.int64)
@@ -140,7 +151,8 @@ def build_agent_tool_id_buffers(
             # Leave mask as zeros so padding/UNK slots are ignored in mean pooling.
             idx_pad[i, 0] = unk_idx
             continue
-        for j, name in enumerate(lst[:max_t]):
+        capped_list = lst if max_tools_per_agent is None else lst[:max_tools_per_agent]
+        for j, name in enumerate(capped_list[:max_t]):
             idx_pad[i, j] = tool_vocab_map.get(name, unk_idx)
             mask[i, j] = 1.0
     return idx_pad, mask
