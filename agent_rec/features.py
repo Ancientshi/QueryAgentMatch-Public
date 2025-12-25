@@ -67,11 +67,11 @@ def build_agent_content_view(
     if use_model_content_vector:
         if A_model_content is None:
             raise ValueError("A_model_content is required when use_model_content_vector=True")
-        parts.append(np.asarray(A_model_content, dtype=np.float32, copy=False))
+        parts.append(np.array(A_model_content, dtype=np.float32, copy=False))
     if use_tool_content_vector:
         if A_tool_content is None:
             raise ValueError("A_tool_content is required when use_tool_content_vector=True")
-        parts.append(np.asarray(A_tool_content, dtype=np.float32, copy=False))
+        parts.append(np.array(A_tool_content, dtype=np.float32, copy=False))
 
     if not parts:
         raise ValueError("Enable at least one of use_model_content_vector/use_tool_content_vector.")
@@ -369,10 +369,10 @@ def to_2d_float32(x: np.ndarray | list | tuple) -> np.ndarray:
     if isinstance(x, tuple) and len(x) == 3:
         arr, inv_order, _ = x
         x = arr if inv_order is None else arr[inv_order, :]
-    x = np.asarray(x)
+    x = np.array(x)
     if x.dtype == np.object_ or x.ndim != 2:
         try:
-            x = np.vstack([np.asarray(row, dtype=np.float32) for row in x])
+            x = np.vstack([np.array(row, dtype=np.float32) for row in x])
         except Exception as e:
             raise ValueError(
                 f"Embedding batch is ragged or non-2D: {type(x)}, shape={getattr(x, 'shape', None)}"
@@ -396,13 +396,13 @@ def _post_embed(embed_url: str, docs: List[str]) -> np.ndarray:
         payload = response.json()
         if "embeddings" not in payload:
             raise ValueError("Embedding service response missing `embeddings` field.")
-        return np.asarray(payload["embeddings"], dtype=np.float32)
+        return np.array(payload["embeddings"], dtype=np.float32)
 
     from utils import load_BGEM3_model, get_embeddings
 
     load_BGEM3_model()
     embs = get_embeddings(docs)
-    return np.asarray(embs, dtype=np.float32)
+    return np.array(embs, dtype=np.float32)
 
 
 def batch_embed(

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../common_env.sh"
 
-EPOCHS=5
+EPOCHS=10
 BATCH_SIZE=4096
 
 python "$SCRIPT_DIR/../../run_bpr_mf_knn.py" \
