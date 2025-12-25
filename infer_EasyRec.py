@@ -8,7 +8,7 @@ Example:
     --data_root /path/to/benchmark \
     --service_url http://127.0.0.1:8500/compute_scores \
     --pos_topk 10 \
-    --ks 1,5,10 \
+    --ks 10 \
     --rerank_batch 32 \
     --timeout 300 \
     --max_workers 16
@@ -123,12 +123,13 @@ def main() -> None:
         default=0,
         help="Positive cutoff per query. 0 = use per-part defaults (POS_TOPK_BY_PART).",
     )
-    ap.add_argument("--ks", type=str, default="5,10,50")
-    ap.add_argument("--seed", type=int, default=123)
+    ap.add_argument("--ks", type=str, default=str(EVAL_TOPK))
+    ap.add_argument("--seed", type=int, default=1234, help="Global seed for data prep and negatives.")
+    ap.add_argument("--split_seed", type=int, default=42, help="Seed for stratified eval split to match baselines.")
     ap.add_argument("--valid_ratio", type=float, default=0.2, help="Portion of qids (with rankings) used for eval.")
     ap.add_argument("--rerank_batch", type=int, default=256, help="Max documents per HTTP request.")
     ap.add_argument("--timeout", type=int, default=300, help="HTTP timeout (seconds)")
-    ap.add_argument("--max_eval", type=int, default=50, help="Max number of eval queries. 0 = use all.")
+    ap.add_argument("--max_eval", type=int, default=0, help="Max number of eval queries. 0 = use all.")
 
     ap.add_argument("--max_workers", type=int, default=16, help="Thread pool size")
     ap.add_argument("--http_retries", type=int, default=3, help="HTTP retry count")
@@ -152,7 +153,12 @@ def main() -> None:
         seed=args.seed,
         with_tools=True,
     )
-    eval_qids = select_eval_qids(boot.qids_in_rank, seed=args.seed, valid_ratio=args.valid_ratio)
+    eval_qids = select_eval_qids(
+        boot.qids_in_rank,
+        seed=args.split_seed,
+        valid_ratio=args.valid_ratio,
+        qid_to_part=boot.bundle.qid_to_part,
+    )
     agent_text_cache = build_agent_text_cache(boot.bundle.all_agents, boot.tools or {})
 
     items = prepare_eval_items(
