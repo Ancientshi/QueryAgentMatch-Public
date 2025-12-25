@@ -20,12 +20,14 @@ EMBED_BATCH="${EMBED_BATCH:-64}"
 HID="${HID:-256}"
 TEMPERATURE="${TEMPERATURE:-0.07}"
 EVAL_CHUNK="${EVAL_CHUNK:-8192}"
-USE_TOOL_EMB="${USE_TOOL_EMB:-0}"
-USE_AGENT_ID_EMB="${USE_AGENT_ID_EMB:-0}"
+USE_TOOL_ID_EMB="${USE_TOOL_ID_EMB:-${USE_TOOL_EMB:-0}}"
+USE_LLM_ID_EMB="${USE_LLM_ID_EMB:-${USE_AGENT_ID_EMB:-0}}"
+USE_MODEL_CONTENT_VECTOR="${USE_MODEL_CONTENT_VECTOR:-1}"
+USE_TOOL_CONTENT_VECTOR="${USE_TOOL_CONTENT_VECTOR:-1}"
 USE_QUERY_ID_EMB="${USE_QUERY_ID_EMB:-0}"
 TOPK="${TOPK:-10}"
 
-log_cfg "model=two_tower_bge embed_url=$EMBED_URL embed_batch=$EMBED_BATCH hid=$HID use_tool_emb=$USE_TOOL_EMB"
+log_cfg "model=two_tower_bge embed_url=$EMBED_URL embed_batch=$EMBED_BATCH hid=$HID use_tool_id_emb=$USE_TOOL_ID_EMB"
 
 python "$SCRIPT_DIR/../../run_twotower_bge.py" \
   --data_root "$DATA_ROOT" \
@@ -38,7 +40,9 @@ python "$SCRIPT_DIR/../../run_twotower_bge.py" \
   --temperature "$TEMPERATURE" \
   --topk "$TOPK" \
   --eval_chunk "$EVAL_CHUNK" \
-  --use_tool_emb "$USE_TOOL_EMB" \
-  --use_agent_id_emb "$USE_AGENT_ID_EMB" \
+  --use_tool_id_emb "$USE_TOOL_ID_EMB" \
+  --use_llm_id_emb "$USE_LLM_ID_EMB" \
+  --use_model_content_vector "$USE_MODEL_CONTENT_VECTOR" \
+  --use_tool_content_vector "$USE_TOOL_CONTENT_VECTOR" \
   --use_query_id_emb "$USE_QUERY_ID_EMB" \
   --exp_name "two_tower_bge${EXP_SUFFIX:+_$EXP_SUFFIX}"

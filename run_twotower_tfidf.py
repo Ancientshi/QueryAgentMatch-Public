@@ -30,6 +30,7 @@ from agent_rec.cli_common import add_shared_training_args
 from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FEATURES
 from agent_rec.data import stratified_train_valid_split
 from agent_rec.features import (
+    build_agent_content_view,
     build_twotower_feature_cache,
     feature_cache_exists,
     load_feature_cache,
@@ -183,10 +184,23 @@ def main() -> None:
     parser.add_argument("--rebuild_feature_cache", type=int, default=0)
     parser.add_argument("--eval_chunk", type=int, default=8192, help="batch size over agents for inference")
     parser.add_argument("--amp", type=int, default=0, help="1 to enable autocast on CUDA (bfloat16)")
-    parser.add_argument("--use_tool_emb", type=int, default=1)
-    parser.add_argument("--use_agent_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
+    parser.add_argument("--use_tool_id_emb", type=int, default=1)
+    parser.add_argument("--use_llm_id_emb", type=int, default=0, help="1 to add agent-ID embedding into agent tower")
+    parser.add_argument(
+        "--use_model_content_vector", type=int, default=1, help="1 to include V_model(A) in agent content view"
+    )
+    parser.add_argument(
+        "--use_tool_content_vector", type=int, default=1, help="1 to include V_tool_content(A) in agent content view"
+    )
+    parser.add_argument("--use_tool_emb", type=int, default=None, help="Deprecated alias for --use_tool_id_emb")
+    parser.add_argument("--use_agent_id_emb", type=int, default=None, help="Deprecated alias for --use_llm_id_emb")
     parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to add query-ID embedding into query tower")
     args = parser.parse_args()
+
+    use_tool_id_emb = bool(args.use_tool_id_emb if args.use_tool_emb is None else args.use_tool_emb)
+    use_llm_id_emb = bool(args.use_llm_id_emb if args.use_agent_id_emb is None else args.use_agent_id_emb)
+    use_model_content_vector = bool(args.use_model_content_vector)
+    use_tool_content_vector = bool(args.use_tool_content_vector)
 
     boot = bootstrap_run(
         data_root=args.data_root,
@@ -234,7 +248,11 @@ def main() -> None:
         print(f"[cache] saved features to {feature_cache_dir}")
 
     Q_cpu = feature_cache.Q.astype(np.float32)
-    A_cpu = feature_cache.A_text_full.astype(np.float32)
+    A_cpu = build_agent_content_view(
+        cache=feature_cache,
+        use_model_content_vector=use_model_content_vector,
+        use_tool_content_vector=use_tool_content_vector,
+    )
     tool_ids_np = feature_cache.agent_tool_idx_padded
     tool_mask_np = feature_cache.agent_tool_mask
 
@@ -280,8 +298,8 @@ def main() -> None:
         agent_tool_mask=torch.tensor(tool_mask_np, dtype=torch.float32, device=device),
         agent_llm_idx=torch.tensor(feature_cache.agent_llm_idx, dtype=torch.long, device=device),
         hid=args.hid,
-        tool_emb=bool(args.use_tool_emb),
-        llm_id_emb=bool(args.use_agent_id_emb),
+        use_tool_id_emb=use_tool_id_emb,
+        use_llm_id_emb=use_llm_id_emb,
         num_agents=len(a_ids),
         num_queries=len(q_ids),
         use_query_id_emb=bool(args.use_query_id_emb),
@@ -351,8 +369,11 @@ def main() -> None:
             "num_agents": int(len(a_ids)),
         },
         "flags": {
-            "use_tool_emb": bool(args.use_tool_emb),
-            "use_llm_id_emb": bool(args.use_agent_id_emb),
+            "use_tool_id_emb": use_tool_id_emb,
+            "use_llm_id_emb": use_llm_id_emb,
+            "use_model_content_vector": use_model_content_vector,
+            "use_tool_content_vector": use_tool_content_vector,
+            "use_query_id_emb": bool(args.use_query_id_emb),
         },
         "mappings": {"q_ids": q_ids, "a_ids": a_ids, "tool_names": feature_cache.tool_names},
     }

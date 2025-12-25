@@ -19,6 +19,7 @@ from agent_rec.features import (
     build_feature_cache,
     build_unified_corpora,
     feature_cache_exists,
+    build_agent_content_view,
     load_feature_cache,
     load_q_vectorizer,
     save_feature_cache,
@@ -48,6 +49,10 @@ def main():
     parser.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
     parser.add_argument("--rebuild_feature_cache", type=int, default=0)
     parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to add optional query-ID embedding")
+    parser.add_argument("--use_llm_id_emb", type=int, default=1)
+    parser.add_argument("--use_tool_id_emb", type=int, default=1)
+    parser.add_argument("--use_model_content_vector", type=int, default=1)
+    parser.add_argument("--use_tool_content_vector", type=int, default=1)
 
     args = parser.parse_args()
     boot = bootstrap_run(
@@ -100,7 +105,11 @@ def main():
         print(f"[cache] saved features to {feature_cache_dir}")
 
     Q_np = feature_cache.Q.astype(np.float32)
-    A_text_full_np = feature_cache.A_text_full.astype(np.float32)
+    A_text_full_np = build_agent_content_view(
+        cache=feature_cache,
+        use_model_content_vector=bool(args.use_model_content_vector),
+        use_tool_content_vector=bool(args.use_tool_content_vector),
+    )
     tool_ids_np = feature_cache.agent_tool_idx_padded
     tool_mask_np = feature_cache.agent_tool_mask
     llm_idx_np = feature_cache.agent_llm_idx
@@ -155,8 +164,8 @@ def main():
         id_dim=args.id_dim,
         num_queries=len(q_ids),
         use_query_id_emb=bool(args.use_query_id_emb),
-        use_tool_id_emb=True,
-        use_llm_id_emb=True,
+        use_tool_id_emb=bool(args.use_tool_id_emb),
+        use_llm_id_emb=bool(args.use_llm_id_emb),
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -215,6 +224,13 @@ def main():
             "num_tools": len(tool_names),
             "text_hidden": args.text_hidden,
             "id_dim": args.id_dim,
+        },
+        "flags": {
+            "use_llm_id_emb": bool(args.use_llm_id_emb),
+            "use_tool_id_emb": bool(args.use_tool_id_emb),
+            "use_model_content_vector": bool(args.use_model_content_vector),
+            "use_tool_content_vector": bool(args.use_tool_content_vector),
+            "use_query_id_emb": bool(args.use_query_id_emb),
         },
         "mappings": {"q_ids": q_ids, "a_ids": a_ids, "tool_names": tool_names},
         "args": vars(args),

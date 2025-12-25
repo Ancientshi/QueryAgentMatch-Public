@@ -20,6 +20,7 @@ from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.eval import evaluate_sampled_embedding_topk, split_eval_qids_by_part
 from agent_rec.features import (
+    build_agent_content_view,
     build_agent_tool_id_buffers,
     build_unified_corpora,
     UNK_TOOL_TOKEN,
@@ -328,7 +329,19 @@ def main():
     parser.add_argument("--lora_dropout", type=float, default=0.0)
     parser.add_argument("--lora_targets", type=str, default="q_lin,k_lin,v_lin,out_lin")
     parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to enable query-ID embedding")
+    parser.add_argument("--use_llm_id_emb", type=int, default=1)
+    parser.add_argument("--use_tool_id_emb", type=int, default=1)
+    parser.add_argument(
+        "--use_model_content_vector", type=int, default=1, help="1 to include V_model(A) in content view"
+    )
+    parser.add_argument(
+        "--use_tool_content_vector", type=int, default=1, help="1 to include V_tool_content(A) in content view"
+    )
     args = parser.parse_args()
+
+    active_content_parts = int(bool(args.use_model_content_vector)) + int(bool(args.use_tool_content_vector))
+    if active_content_parts == 0:
+        raise ValueError("Enable at least one of use_model_content_vector/use_tool_content_vector.")
 
     boot = bootstrap_run(
         data_root=args.data_root,
@@ -471,7 +484,6 @@ def main():
                 Q_emb,
                 A_model_emb,
                 A_tool_emb,
-                A_emb,
                 agent_tool_idx_padded_np,
                 agent_tool_mask_np,
                 agent_llm_idx_np,
@@ -496,7 +508,7 @@ def main():
                 print("[cache] transformer cache mismatch; rebuilding embeddings...")
                 Q_emb = A_emb = A_model_emb = A_tool_emb = None
 
-        if Q_emb is None or A_emb is None:
+        if Q_emb is None or A_model_emb is None or A_tool_emb is None:
             encoder.eval()
             with torch.no_grad():
                 Q_emb = encode_texts(
@@ -539,7 +551,12 @@ def main():
                 A_model_emb = A_model_emb / (np.linalg.norm(A_model_emb, axis=1, keepdims=True) + 1e-8)
                 if A_tool_emb.size > 0:
                     A_tool_emb = A_tool_emb / (np.linalg.norm(A_tool_emb, axis=1, keepdims=True) + 1e-8)
-                A_emb = np.concatenate([A_model_emb, A_tool_emb], axis=1).astype(np.float32)
+                A_emb = build_agent_content_view(
+                    A_model_content=A_model_emb,
+                    A_tool_content=A_tool_emb,
+                    use_model_content_vector=bool(args.use_model_content_vector),
+                    use_tool_content_vector=bool(args.use_tool_content_vector),
+                )
             save_transformer_cache(
                 transformer_cache_dir,
                 q_ids,
@@ -561,9 +578,18 @@ def main():
                     "pretrained_model": args.pretrained_model,
                     "max_len": args.max_len,
                     "pooling": args.pooling,
+                    "use_model_content_vector": bool(args.use_model_content_vector),
+                    "use_tool_content_vector": bool(args.use_tool_content_vector),
                 },
             )
             print(f"[cache] saved transformer embeddings to {transformer_cache_dir}")
+        else:
+            A_emb = build_agent_content_view(
+                A_model_content=A_model_emb,
+                A_tool_content=A_tool_emb,
+                use_model_content_vector=bool(args.use_model_content_vector),
+                use_tool_content_vector=bool(args.use_tool_content_vector),
+            )
     else:
         encoder.train()
 
@@ -575,10 +601,11 @@ def main():
             tmp = encode_batch(tokenizer, encoder, ["hello"], device, max_len=args.max_len, pooling=args.pooling)
             d_text = int(tmp.shape[1])
         encoder.train()
+    agent_content_dim = int(A_emb.shape[1]) if use_embedding_cache else int(d_text * active_content_parts)
 
     model = SimpleBPRDNN(
         d_q=d_text,
-        d_a=d_text,
+        d_a=agent_content_dim,
         num_tools=len(tool_id_vocab),
         num_llm_ids=len(llm_vocab),
         agent_tool_indices_padded=agent_tool_idx_padded.to(device),
@@ -588,8 +615,8 @@ def main():
         id_dim=args.id_dim,
         num_queries=len(q_ids),
         use_query_id_emb=bool(args.use_query_id_emb),
-        use_tool_id_emb=True,
-        use_llm_id_emb=True,
+        use_tool_id_emb=bool(args.use_tool_id_emb),
+        use_llm_id_emb=bool(args.use_llm_id_emb),
     ).to(device)
 
     head_params = list(model.parameters())
@@ -650,34 +677,47 @@ def main():
                 )
                 model_emb = F.normalize(model_emb, dim=-1)
 
-                needed_tools = []
-                for idx_agent in uniq_agents.tolist():
-                    needed_tools.extend([t for t in a_tool_lists[idx_agent]])
-                needed_tools = sorted(set(needed_tools))
-                tool_emb_map = {}
-                if needed_tools:
-                    names_in_vocab = [t for t in needed_tools if t in tool_names]
-                    tool_text_batch = [tool_texts[tool_names.index(t)] for t in names_in_vocab]
-                    if tool_text_batch:
-                        tool_emb_batch = encode_batch(
-                            tokenizer, encoder, tool_text_batch, device, max_len=args.max_len, pooling=args.pooling
-                        )
-                        tool_emb_batch = F.normalize(tool_emb_batch, dim=-1)
-                        for name, emb in zip(names_in_vocab, tool_emb_batch):
-                            tool_emb_map[name] = emb
-                tool_dim = model_emb.shape[1]
-                zero_tool = torch.zeros((tool_dim,), device=device)
-                tool_feats = []
-                for idx_agent in uniq_agents.tolist():
-                    names = [t for t in a_tool_lists[idx_agent] if t in tool_emb_map]
-                    if names:
-                        stacked = torch.stack([tool_emb_map[n] for n in names], dim=0)
-                        tool_feats.append(stacked.mean(dim=0))
-                    else:
-                        tool_feats.append(zero_tool)
-                tool_feats_t = torch.stack(tool_feats, dim=0)
-                tool_feats_t = F.normalize(tool_feats_t, dim=-1) if tool_feats_t.numel() > 0 else tool_feats_t
-                content_all = torch.cat([model_emb, tool_feats_t], dim=-1)
+                content_parts = []
+                if args.use_model_content_vector:
+                    content_parts.append(model_emb)
+
+                tool_feats_t: torch.Tensor
+                if args.use_tool_content_vector:
+                    needed_tools = []
+                    for idx_agent in uniq_agents.tolist():
+                        needed_tools.extend([t for t in a_tool_lists[idx_agent]])
+                    needed_tools = sorted(set(needed_tools))
+                    tool_emb_map = {}
+                    if needed_tools:
+                        names_in_vocab = [t for t in needed_tools if t in tool_names]
+                        tool_text_batch = [tool_texts[tool_names.index(t)] for t in names_in_vocab]
+                        if tool_text_batch:
+                            tool_emb_batch = encode_batch(
+                                tokenizer, encoder, tool_text_batch, device, max_len=args.max_len, pooling=args.pooling
+                            )
+                            tool_emb_batch = F.normalize(tool_emb_batch, dim=-1)
+                            for name, emb in zip(names_in_vocab, tool_emb_batch):
+                                tool_emb_map[name] = emb
+                    tool_dim = model_emb.shape[1]
+                    zero_tool = torch.zeros((tool_dim,), device=device)
+                    tool_feats = []
+                    for idx_agent in uniq_agents.tolist():
+                        names = [t for t in a_tool_lists[idx_agent] if t in tool_emb_map]
+                        if names:
+                            stacked = torch.stack([tool_emb_map[n] for n in names], dim=0)
+                            tool_feats.append(stacked.mean(dim=0))
+                        else:
+                            tool_feats.append(zero_tool)
+                    tool_feats_t = torch.stack(tool_feats, dim=0)
+                    tool_feats_t = F.normalize(tool_feats_t, dim=-1) if tool_feats_t.numel() > 0 else tool_feats_t
+                    content_parts.append(tool_feats_t)
+                else:
+                    tool_feats_t = torch.zeros((model_emb.size(0), 0), device=device)
+
+                if not content_parts:
+                    raise ValueError("Enable at least one content component for agent representation.")
+
+                content_all = torch.cat(content_parts, dim=-1) if len(content_parts) > 1 else content_parts[0]
                 agent_order = uniq_agents.tolist()
                 pos_vec = content_all[[agent_order.index(i.item()) for i in pos_idx]]
                 neg_vec = content_all[[agent_order.index(i.item()) for i in neg_idx]]
@@ -737,7 +777,12 @@ def main():
             A_tool_eval.append(np.zeros((tool_emb_eval.shape[1],), dtype=np.float32))
         A_tool_eval = np.stack(A_tool_eval, axis=0)
         A_tool_eval = A_tool_eval / (np.linalg.norm(A_tool_eval, axis=1, keepdims=True) + 1e-8)
-        A_emb_eval = np.concatenate([A_model_eval, A_tool_eval], axis=1).astype(np.float32)
+        A_emb_eval = build_agent_content_view(
+            A_model_content=A_model_eval,
+            A_tool_content=A_tool_eval,
+            use_model_content_vector=bool(args.use_model_content_vector),
+            use_tool_content_vector=bool(args.use_tool_content_vector),
+        )
         A_t = torch.from_numpy(A_emb_eval).to(device)
 
     model_dir = os.path.join(exp_cache_dir, "models")
@@ -757,6 +802,13 @@ def main():
             "num_llm_ids": len(llm_vocab),
             "text_hidden": args.text_hidden,
             "id_dim": args.id_dim,
+        },
+        "flags": {
+            "use_llm_id_emb": bool(args.use_llm_id_emb),
+            "use_tool_id_emb": bool(args.use_tool_id_emb),
+            "use_model_content_vector": bool(args.use_model_content_vector),
+            "use_tool_content_vector": bool(args.use_tool_content_vector),
+            "use_query_id_emb": bool(args.use_query_id_emb),
         },
         "mappings": {"q_ids": q_ids, "a_ids": a_ids, "tool_names": tool_names},
         "args": vars(args),

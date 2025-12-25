@@ -42,6 +42,51 @@ class FeatureCache:
     agent_tool_mask: np.ndarray
 
 
+def build_agent_content_view(
+    *,
+    cache: FeatureCache | None = None,
+    A_model_content: np.ndarray | None = None,
+    A_tool_content: np.ndarray | None = None,
+    use_model_content_vector: bool = True,
+    use_tool_content_vector: bool = True,
+) -> np.ndarray:
+    """
+    Build the agent content representation
+    ϕ_content(A)=concat(V_model(A), V_tool_content(A)).
+
+    Set use_model_content_vector/use_tool_content_vector to control which parts
+    are included. At least one of them must be True.
+    """
+    if cache is not None:
+        if A_model_content is None:
+            A_model_content = cache.A_model_content
+        if A_tool_content is None:
+            A_tool_content = cache.A_tool_content
+
+    parts: List[np.ndarray] = []
+    if use_model_content_vector:
+        if A_model_content is None:
+            raise ValueError("A_model_content is required when use_model_content_vector=True")
+        parts.append(np.asarray(A_model_content, dtype=np.float32, copy=False))
+    if use_tool_content_vector:
+        if A_tool_content is None:
+            raise ValueError("A_tool_content is required when use_tool_content_vector=True")
+        parts.append(np.asarray(A_tool_content, dtype=np.float32, copy=False))
+
+    if not parts:
+        raise ValueError("Enable at least one of use_model_content_vector/use_tool_content_vector.")
+
+    num_agents = parts[0].shape[0]
+    for p in parts[1:]:
+        if p.shape[0] != num_agents:
+            raise ValueError(f"Content part row mismatch: {p.shape[0]} vs expected {num_agents}")
+
+    out = np.concatenate(parts, axis=1).astype(np.float32)
+    if out.shape[1] == 0:
+        raise ValueError("Agent content view has zero width; check content flags and source vectors.")
+    return out
+
+
 def _tool_text(name: str, tools: Dict[str, dict]) -> str:
     t = tools.get(name, {}) or {}
     desc = t.get("description", "")
@@ -175,7 +220,9 @@ def build_feature_cache(
 
     A_model_content = A_model_csr.toarray().astype(np.float32)
     A_tool_content = agent_tool_text_matrix(a_tool_lists, tool_names, Tm_csr)
-    A_text_full = np.concatenate([A_model_content, A_tool_content], axis=1).astype(np.float32)
+    A_text_full = build_agent_content_view(
+        A_model_content=A_model_content, A_tool_content=A_tool_content, use_model_content_vector=True
+    )
 
     tool_id_vocab = _build_tool_vocab(tool_names)
     tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
@@ -469,7 +516,9 @@ def build_twotower_bge_feature_cache(
     if A_tool_emb.size > 0:
         A_tool_emb = l2_normalize(A_tool_emb)
 
-    A_text_full = np.concatenate([A_model_emb, A_tool_emb], axis=1).astype(np.float32)
+    A_text_full = build_agent_content_view(
+        A_model_content=A_model_emb, A_tool_content=A_tool_emb, use_model_content_vector=True
+    )
 
     tool_id_vocab = _build_tool_vocab(tool_names)
     tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
