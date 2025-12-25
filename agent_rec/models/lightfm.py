@@ -82,6 +82,7 @@ class LightFM(RecommenderBase):
         use_llm_id_emb: bool = True,
     ):
         super().__init__()
+        self.num_a = int(num_a)
         self.add_bias = add_bias
         self.alpha_id = nn.Parameter(torch.tensor(alpha_id, dtype=torch.float32))
         self.alpha_feat = nn.Parameter(torch.tensor(alpha_feat, dtype=torch.float32))
@@ -211,7 +212,7 @@ class LightFM(RecommenderBase):
 
     def export_agent_embeddings(self, batch_size: Optional[int] = 4096) -> np.ndarray:
         with torch.no_grad():
-            num_items = self.emb_a.num_embeddings
+            num_items = self.num_a
             if batch_size is None or batch_size >= num_items:
                 a_idx = torch.arange(num_items, device=self.device, dtype=torch.long)
                 return self.item_repr_batch(a_idx).detach().cpu().numpy().astype(np.float32)

@@ -45,7 +45,7 @@ def main():
         lr_default=1e-3,
     )
     parser.add_argument("--text_hidden", type=int, default=256)
-    parser.add_argument("--id_dim", type=int, default=64)
+    parser.add_argument("--id_dim", type=int, default=32)
     parser.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
     parser.add_argument("--rebuild_feature_cache", type=int, default=0)
     parser.add_argument("--use_query_id_emb", type=int, default=0, help="1 to add optional query-ID embedding")
@@ -59,7 +59,6 @@ def main():
         data_root=args.data_root,
         exp_name=args.exp_name,
         topk=args.topk,
-        seed=1234,
         with_tools=True,
     )
 
@@ -258,7 +257,6 @@ def main():
         pos_topk_by_part=POS_TOPK_BY_PART,
         pos_topk_default=POS_TOPK,
         topk=topk,
-        seed=123,
         desc=f"Valid Overall (direct q-vector, top{topk})",
     )
     print_metrics_table("Validation Overall (direct q-vector)", overall_metrics, ks=(topk,), filename=args.exp_name)
@@ -282,7 +280,6 @@ def main():
             pos_topk_by_part=POS_TOPK_BY_PART,
             pos_topk_default=POS_TOPK,
             topk=topk,
-            seed=123,
             desc=f"Valid {part} (direct q-vector, top{topk})",
         )
         print_metrics_table(f"Validation {part} (direct q-vector)", m_part, ks=(topk,), filename=args.exp_name)
