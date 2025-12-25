@@ -11,7 +11,7 @@ def add_shared_training_args(
     parser: argparse.ArgumentParser,
     *,
     exp_name_default: str,
-    device_default: str = "cpu",
+    device_default: str = "cuda:0",
     epochs_default: int = 5,
     batch_size_default: int = 1024,
     lr_default: Optional[float] = None,

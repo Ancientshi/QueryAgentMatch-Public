@@ -119,7 +119,7 @@ def bootstrap_run(
     exp_name: str,
     *,
     topk: int,
-    seed: int,
+    seed: int = 1234,
     with_tools: bool = False,
     parts: Iterable[str] = DEFAULT_PARTS,
 ) -> RunBootstrap:

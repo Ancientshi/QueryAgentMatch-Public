@@ -29,7 +29,6 @@ def main():
     add_shared_training_args(
         parser,
         exp_name_default="bpr_mf_knn",
-        device_default="cpu",
         epochs_default=5,
         batch_size_default=4096,
         lr_default=5e-3,
@@ -44,7 +43,6 @@ def main():
         data_root=args.data_root,
         exp_name=args.exp_name,
         topk=args.topk,
-        seed=1234,
         with_tools=False,
     )
 
@@ -197,7 +195,6 @@ def main():
         pos_topk_default=POS_TOPK,
         topk=topk,
         score_mode=args.score_mode,
-        seed=123,
         desc=f"Valid Overall (KNN q-vector, top{topk})",
     )
     print_metrics_table("Validation Overall (KNN q-vector)", overall_metrics, ks=(topk,), filename=args.exp_name)
@@ -221,7 +218,6 @@ def main():
             pos_topk_default=POS_TOPK,
             topk=topk,
             score_mode=args.score_mode,
-            seed=123,
             desc=f"Valid {part} (KNN q-vector, top{topk})",
         )
         print_metrics_table(f"Validation {part} (KNN q-vector)", m_part, ks=(topk,), filename=args.exp_name)
