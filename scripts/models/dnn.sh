@@ -25,8 +25,8 @@ python "$SCRIPT_DIR/../../run_dnn.py" \
   --neg_per_pos "$NEG_PER_POS" \
   --eval_cand_size "$EVAL_CAND_SIZE" \
   --use_query_id_emb 0 \
-  --use_llm_id_emb 0 \
-  --use_tool_id_emb 0 \
+  --use_llm_id_emb 1 \
+  --use_tool_id_emb 1 \
   --use_model_content_vector 1 \
   --use_tool_content_vector 1 \
   --exp_name "bpr_dnn"
