@@ -19,6 +19,7 @@ from agent_rec.config import EVAL_TOPK, POS_TOPK, POS_TOPK_BY_PART, TFIDF_MAX_FE
 from agent_rec.data import build_training_pairs, stratified_train_valid_split
 from agent_rec.features import (
     build_agent_tool_id_buffers,
+    build_agent_content_view,
     build_feature_cache,
     build_unified_corpora,
     feature_cache_exists,
@@ -62,7 +63,10 @@ def main():
 
     parser.add_argument("--user_features_path", type=str, default="")
     parser.add_argument("--item_features_path", type=str, default="")
+    parser.add_argument("--use_llm_id_emb", type=int, default=1)
     parser.add_argument("--use_tool_id_emb", type=int, default=0)
+    parser.add_argument("--use_model_content_vector", type=int, default=1)
+    parser.add_argument("--use_tool_content_vector", type=int, default=1)
     parser.add_argument("--alpha_tool", type=float, default=1.0)
 
     parser.add_argument("--knn_N", type=int, default=3)
@@ -129,6 +133,11 @@ def main():
     if feature_cache is None:
         Q_np = U.toarray().astype(np.float32)
         A_text_full_np = V.toarray().astype(np.float32)
+        if not args.use_model_content_vector or not args.use_tool_content_vector:
+            print(
+                "[warn] Custom feature matrices provided; "
+                "use_model_content_vector/use_tool_content_vector flags are ignored."
+            )
         _, _, _, _, _, _, a_tool_lists, llm_ids = build_unified_corpora(all_agents, all_questions, tools)
         tool_id_vocab = [UNK_TOOL_TOKEN] + tool_names
         tool_vocab_map = {n: i for i, n in enumerate(tool_id_vocab)}
@@ -139,7 +148,11 @@ def main():
         agent_llm_idx = np.array([llm_vocab_map.get(lid, 0) for lid in llm_ids], dtype=np.int64)
     else:
         Q_np = feature_cache.Q.astype(np.float32)
-        A_text_full_np = feature_cache.A_text_full.astype(np.float32)
+        A_text_full_np = build_agent_content_view(
+            cache=feature_cache,
+            use_model_content_vector=bool(args.use_model_content_vector),
+            use_tool_content_vector=bool(args.use_tool_content_vector),
+        )
         agent_tool_idx_padded = feature_cache.agent_tool_idx_padded
         agent_tool_mask = feature_cache.agent_tool_mask
         tool_id_vocab = feature_cache.tool_id_vocab
@@ -204,7 +217,7 @@ def main():
         alpha_tool=args.alpha_tool,
         device=device,
         agent_llm_idx=torch.tensor(agent_llm_idx, dtype=torch.long, device=device),
-        use_llm_id_emb=True,
+        use_llm_id_emb=bool(args.use_llm_id_emb),
     ).to(device)
     model.set_user_feat_lists(u_feats_per_row, u_vals_per_row)
     model.set_item_feat_lists(i_feats_per_row, i_vals_per_row)

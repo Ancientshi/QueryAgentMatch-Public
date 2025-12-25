@@ -24,8 +24,8 @@ class TwoTowerTFIDF(RecommenderBase):
         agent_tool_mask: torch.FloatTensor,
         agent_llm_idx: torch.LongTensor,
         hid: int = 256,
-        tool_emb: bool = True,
-        llm_id_emb: bool = False,
+        use_tool_id_emb: bool = True,
+        use_llm_id_emb: bool = False,
         num_agents: int = 0,
         num_queries: int = 0,
         use_query_id_emb: bool = False,
@@ -35,14 +35,14 @@ class TwoTowerTFIDF(RecommenderBase):
         self.q_proj = nn.Sequential(nn.Linear(d_q, hid), nn.ReLU(), nn.Linear(hid, hid))
         self.a_proj = nn.Sequential(nn.Linear(d_a, hid), nn.ReLU(), nn.Linear(hid, hid))
 
-        self.use_tool_emb = bool(tool_emb) and num_tools > 0
-        if self.use_tool_emb:
+        self.use_tool_id_emb = bool(use_tool_id_emb) and num_tools > 0
+        if self.use_tool_id_emb:
             self.emb_tool = nn.Embedding(num_tools, hid)
             nn.init.xavier_uniform_(self.emb_tool.weight)
         else:
             self.emb_tool = None
 
-        self.use_llm_id_emb = bool(llm_id_emb) and num_llm_ids > 0
+        self.use_llm_id_emb = bool(use_llm_id_emb) and num_llm_ids > 0
         if self.use_llm_id_emb:
             self.emb_llm = nn.Embedding(num_llm_ids, hid)
             nn.init.xavier_uniform_(self.emb_llm.weight)
@@ -61,7 +61,7 @@ class TwoTowerTFIDF(RecommenderBase):
         self.register_buffer("llm_idx", agent_llm_idx.long())
 
         combine_q_dim = hid + (hid if self.use_query_id_emb else 0)
-        combine_a_dim = hid + (hid if self.use_tool_emb else 0) + (hid if self.use_llm_id_emb else 0)
+        combine_a_dim = hid + (hid if self.use_tool_id_emb else 0) + (hid if self.use_llm_id_emb else 0)
         self.q_head = nn.Linear(combine_q_dim, hid)
         self.a_head = nn.Linear(combine_a_dim, hid)
 
@@ -82,7 +82,7 @@ class TwoTowerTFIDF(RecommenderBase):
         self._query_features = Q.astype(np.float32, copy=False)
 
     def tool_agg(self, agent_idx: torch.LongTensor) -> torch.Tensor:
-        if not self.use_tool_emb:
+        if not self.use_tool_id_emb:
             return torch.zeros((agent_idx.size(0), self.q_proj[-1].out_features), device=agent_idx.device)
         te = self.emb_tool(self.tool_idx[agent_idx])  # (B,T,H)
         mask = self.tool_mask[agent_idx].unsqueeze(-1)  # (B,T,1)
@@ -100,7 +100,7 @@ class TwoTowerTFIDF(RecommenderBase):
 
     def encode_a(self, a_vec: torch.Tensor, agent_idx: torch.LongTensor) -> torch.Tensor:
         parts = [self.a_proj(a_vec)]
-        if self.use_tool_emb:
+        if self.use_tool_id_emb:
             parts.append(self.tool_agg(agent_idx))
         if self.use_llm_id_emb:
             parts.append(self.emb_llm(self.llm_idx[agent_idx]))
@@ -156,7 +156,7 @@ class TwoTowerTFIDF(RecommenderBase):
 
     def extra_state_dict(self) -> Dict[str, Any]:
         return {
-            "use_tool_emb": self.use_tool_emb,
+            "use_tool_id_emb": self.use_tool_id_emb,
             "use_llm_id_emb": self.use_llm_id_emb,
             "use_query_id_emb": self.use_query_id_emb,
             "export_batch_size": self.export_batch_size,
