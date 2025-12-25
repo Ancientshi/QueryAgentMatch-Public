@@ -17,7 +17,7 @@ Example:
     --pos_topk 10 \
     --max_len 192 \
     --rerank_batch 2048 \
-    --ks 5,10,50
+    --ks 10
 """
 
 from __future__ import annotations
@@ -101,7 +101,7 @@ def main() -> None:
         default=None,
         help="HF base model name when --peft=0; if omitted, --model_dir is used directly.",
     )
-    ap.add_argument("--peft", type=int, default=1, help="1 to load PEFT adapter if available, 0 to load raw HF model.")
+    ap.add_argument("--peft", type=int, default=0, help="1 to load PEFT adapter if available, 0 to load raw HF model.")
     ap.add_argument("--device", type=str, default="cuda:0")
     ap.add_argument("--eval_cand_size", type=int, default=1000)
     ap.add_argument(
@@ -112,11 +112,12 @@ def main() -> None:
     )
     ap.add_argument("--max_len", type=int, default=192)
     ap.add_argument("--rerank_batch", type=int, default=256)
-    ap.add_argument("--seed", type=int, default=123)
-    ap.add_argument("--ks", type=str, default="5,10,50")
+    ap.add_argument("--seed", type=int, default=1234, help="Global seed for data prep and negatives.")
+    ap.add_argument("--split_seed", type=int, default=42, help="Seed for stratified eval split to match baselines.")
+    ap.add_argument("--ks", type=str, default=str(EVAL_TOPK))
     ap.add_argument("--use_amp", type=int, default=1, help="1 to enable autocast(float16) on CUDA")
     ap.add_argument("--valid_ratio", type=float, default=0.2, help="Portion of qids (with rankings) used for eval.")
-    ap.add_argument("--max_eval", type=int, default=50, help="Max number of eval queries. 0 = use all.")
+    ap.add_argument("--max_eval", type=int, default=0, help="Max number of eval queries. 0 = use all.")
     args = ap.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -136,7 +137,12 @@ def main() -> None:
         seed=args.seed,
         with_tools=True,
     )
-    eval_qids = select_eval_qids(boot.qids_in_rank, seed=args.seed, valid_ratio=args.valid_ratio)
+    eval_qids = select_eval_qids(
+        boot.qids_in_rank,
+        seed=args.split_seed,
+        valid_ratio=args.valid_ratio,
+        qid_to_part=boot.bundle.qid_to_part,
+    )
     agent_text_cache = build_agent_text_cache(boot.bundle.all_agents, boot.tools or {})
 
     items = prepare_eval_items(
