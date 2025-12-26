@@ -24,8 +24,10 @@ Example:
 from __future__ import annotations
 
 import argparse
+import inspect
 import os
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
@@ -62,15 +64,24 @@ def encode_texts(
     normalize: bool,
     use_amp: bool,
 ) -> np.ndarray:
-    return model.encode(
-        list(texts),
+    encode_kwargs = dict(
         batch_size=batch_size,
         convert_to_numpy=True,
         device=device,
         show_progress_bar=True,
         normalize_embeddings=normalize,
-        use_amp=use_amp,
     )
+
+    supports_use_amp = "use_amp" in inspect.signature(model.encode).parameters
+    if supports_use_amp:
+        encode_kwargs["use_amp"] = use_amp
+        return model.encode(list(texts), **encode_kwargs)
+
+    autocast_ctx = (
+        torch.cuda.amp.autocast(dtype=torch.float16) if use_amp and torch.cuda.is_available() else nullcontext()
+    )
+    with autocast_ctx:
+        return model.encode(list(texts), **encode_kwargs)
 
 
 def main() -> None:
