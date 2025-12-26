@@ -23,23 +23,51 @@ ENCODE_BATCH="${ENCODE_BATCH:-64}"
 NORMALIZE="${NORMALIZE:-1}"
 USE_AMP="${USE_AMP:-1}"
 
-# Set this to the Sentence-Transformers export directory from KALM fine-tuning
-KALM_MODEL_DIR="${KALM_MODEL_DIR:-/home/yunxshi/Data/workspace/QueryAgentMatch/benchmark/KALM/st-biencoder}"
+# Toggle whether to run base / fine-tuned models (run both by default)
+RUN_KALM_BASE="${RUN_KALM_BASE:-1}"
+RUN_KALM_LORA="${RUN_KALM_LORA:-1}"
 
-python "$SCRIPT_DIR/../infer_KALM.py" \
-  --data_root "$DATA_ROOT" \
-  --exp_name "infer_kalm_embedding${EXP_SUFFIX}" \
-  --model_dir "$KALM_MODEL_DIR" \
-  --device "$DEVICE" \
-  --encode_batch "$ENCODE_BATCH" \
-  --eval_cand_size "$EVAL_CAND_SIZE" \
-  --pos_topk "$POS_TOPK" \
-  --ks "$KS" \
-  --max_len "$MAX_LEN" \
-  --use_amp "$USE_AMP" \
-  --normalize "$NORMALIZE" \
-  --seed "$SEED" \
-  --split_seed "$SPLIT_SEED" \
-  --valid_ratio "$VALID_RATIO" \
-  --sample_per_part "$SAMPLE_PER_PART" \
-  --max_eval "$MAX_EVAL"
+# Base model can point to the original KaLM embedding HF repo
+KALM_BASE_MODEL_DIR="${KALM_BASE_MODEL_DIR:-KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5}"
+# Fine-tuned export directory (Sentence-Transformers format)
+KALM_LORA_MODEL_DIR="${KALM_LORA_MODEL_DIR:-/home/yunxshi/Data/workspace/QueryAgentMatch/benchmark/KALM/st-biencoder}"
+
+if [[ "$RUN_KALM_BASE" == "1" ]]; then
+  python "$SCRIPT_DIR/../infer_KALM.py" \
+    --data_root "$DATA_ROOT" \
+    --exp_name "infer_kalm_base${EXP_SUFFIX}" \
+    --model_dir "$KALM_BASE_MODEL_DIR" \
+    --device "$DEVICE" \
+    --encode_batch "$ENCODE_BATCH" \
+    --eval_cand_size "$EVAL_CAND_SIZE" \
+    --pos_topk "$POS_TOPK" \
+    --ks "$KS" \
+    --max_len "$MAX_LEN" \
+    --use_amp "$USE_AMP" \
+    --normalize "$NORMALIZE" \
+    --seed "$SEED" \
+    --split_seed "$SPLIT_SEED" \
+    --valid_ratio "$VALID_RATIO" \
+    --sample_per_part "$SAMPLE_PER_PART" \
+    --max_eval "$MAX_EVAL"
+fi
+
+if [[ "$RUN_KALM_LORA" == "1" ]]; then
+  python "$SCRIPT_DIR/../infer_KALM.py" \
+    --data_root "$DATA_ROOT" \
+    --exp_name "infer_kalm_lora${EXP_SUFFIX}" \
+    --model_dir "$KALM_LORA_MODEL_DIR" \
+    --device "$DEVICE" \
+    --encode_batch "$ENCODE_BATCH" \
+    --eval_cand_size "$EVAL_CAND_SIZE" \
+    --pos_topk "$POS_TOPK" \
+    --ks "$KS" \
+    --max_len "$MAX_LEN" \
+    --use_amp "$USE_AMP" \
+    --normalize "$NORMALIZE" \
+    --seed "$SEED" \
+    --split_seed "$SPLIT_SEED" \
+    --valid_ratio "$VALID_RATIO" \
+    --sample_per_part "$SAMPLE_PER_PART" \
+    --max_eval "$MAX_EVAL"
+fi
