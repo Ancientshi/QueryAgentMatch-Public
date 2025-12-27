@@ -31,3 +31,34 @@ python run_lightfm_handwritten.py \
 Notes:
 - This scaffold assumes you already have `utils.py` in the same folder as `run_bpr_mf_knn.py`,
   providing `print_metrics_table(...)` as your original code uses.
+
+## Run (Generative structured recommender)
+
+Generate structured token outputs (LLM + tools) for a query:
+
+```bash
+python run_generative.py \
+  --data_root /path/to/dataset_root \
+  --query "如何写个爬虫？" \
+  --top_k 3 \
+  --with_metadata 1
+```
+
+Export supervised pairs for seq2seq finetuning (JSONL):
+
+```bash
+python run_generative.py \
+  --data_root /path/to/dataset_root \
+  --export_pairs /tmp/generative_pairs.jsonl \
+  --max_examples 5000
+```
+
+Shell helper (env-style) to avoid long CLI strings:
+
+```bash
+DATA_ROOT=/path/to/dataset_root \
+QUERY="如何写个爬虫？" \
+TOP_K=3 \
+WITH_METADATA=1 \
+./scripts/run_generative.sh
+```
