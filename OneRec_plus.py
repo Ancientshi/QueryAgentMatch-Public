@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OneRec++ (fixed): Candidate-only logits + CPU TF-IDF retrieval + Session-aware + Lite-DPO
-
-Key fixes (for huge vocab / huge agent count):
-  1) NEVER build full (B,L,V) logits. Use candidate-only logits (B,L,C).
-  2) Candidate retrieval (train_mask) moved to CPU sklearn NearestNeighbors on sparse CSR.
-  3) Evaluation / RM sampling / DPO logprob all use candidate-only sets.
-  4) Proper AMP via GradScaler for stability.
+OneRec++ (Query->Agent, improved):
+  ✅ No sessions (true query->agent)
+  ✅ Never build full (B,L,V) logits — candidate-only logits (B,L,C)
+  ✅ CPU TF-IDF retrieval for candidate set
+  ✅ Mixed negatives: hard (TF-IDF) + random
+  ✅ Stronger encoder: QueryEncoder (MLP)
+  ✅ Stronger decoder option: Transformer decoder (default) or GRU
+  ✅ Auxiliary multi-positive InfoNCE (in-batch negatives) for stronger retrieval space
+  ✅ Optional: RM + Lite-DPO finetune (candidate-only logprob)
 
 Dataset:
-  {data_root}/PartI|PartII|PartIII/{agents,questions,rankings}/merge.json + Tools/merge.json
-Optional:
-  {data_root}/sessions.json  # [{"qid": qid, "history": [prev_qid1,...]}]
+  {data_root}/PartI|PartII|PartIII/{agents,questions,rankings}/merge.json
+  {data_root}/Tools/merge.json
+
+Optional BGE feature init:
+  --bge_feature_dir path/to/cache
 """
 
 from agent_rec.features import load_feature_cache, build_agent_content_view
@@ -43,52 +47,7 @@ from utils import print_metrics_table
 filename = os.path.splitext(os.path.basename(__file__))[0]
 
 
-
-from collections import defaultdict
-
-def stratified_split_by_part(
-    qids: List[str],
-    qid_to_part: Dict[str, str],
-    valid_ratio: float,
-    seed: int
-) -> Tuple[List[str], List[str]]:
-    # Delegate to shared splitter to align with other pipelines (ensures per-part minimums).
-    return stratified_train_valid_split(qids, qid_to_part=qid_to_part, valid_ratio=valid_ratio, seed=seed)
-
-
-def sample_qids_by_part(
-    qids: List[str],
-    qid_to_part: Dict[str, str],
-    per_part: int,
-    seed: int,
-    parts: Optional[List[str]] = None
-) -> List[str]:
-    """
-    per_part=200：每个 part 最多取 200；不足则全取。
-    parts=None：自动用出现过的 part；你也可以传 ["PartI","PartII","PartIII"].
-    """
-    if per_part <= 0:
-        return list(qids)
-
-    rng = random.Random(seed)
-    buckets = defaultdict(list)
-    for q in qids:
-        buckets[qid_to_part.get(q, "Unknown")].append(q)
-
-    if parts is None:
-        parts = sorted(buckets.keys())
-
-    out = []
-    for p in parts:
-        lst = buckets.get(p, [])
-        rng.shuffle(lst)
-        out.extend(lst[: min(per_part, len(lst))])
-
-    # 最后再 shuffle 一下，避免 part 顺序偏置
-    rng.shuffle(out)
-    return out
-
-# ---------------------- I/O helpers ----------------------
+# ---------------------- helpers ----------------------
 
 def ensure_cache_dir(root: str) -> str:
     d = os.path.join(root, f".cache/{filename}")
@@ -117,7 +76,6 @@ def collect_data(data_root: str):
         if os.path.exists(questions_path):
             qd = load_json(questions_path)
             all_questions.update(qd)
-            # 标注 qid 来源 part（后写的不覆盖先写的也行；你也可以反过来）
             for qid in qd.keys():
                 qid_to_part.setdefault(qid, part)
 
@@ -125,7 +83,6 @@ def collect_data(data_root: str):
             r = load_json(rankings_path)
             rr = r.get("rankings", {})
             all_rankings.update(rr)
-            # rankings 里的 qid 也补标（有些数据可能 questions/merge 不全）
             for qid in rr.keys():
                 qid_to_part.setdefault(qid, part)
 
@@ -133,14 +90,10 @@ def collect_data(data_root: str):
     tools = load_json(tools_path) if os.path.exists(tools_path) else {}
     return all_agents, all_questions, all_rankings, tools, qid_to_part
 
-
-# ---------------------- Text & TF-IDF ----------------------
-
 def build_text_corpora(all_agents, all_questions, tools):
     q_ids = sorted(all_questions.keys())
     q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
 
-    tool_names = sorted(tools.keys())
     def _tool_text(tn: str) -> str:
         t = tools.get(tn, {})
         desc = t.get("description", "")
@@ -165,87 +118,50 @@ def build_q_vectorizer(q_texts, max_features: int):
     Q_csr = q_vec.fit_transform(q_texts)
     return q_vec, Q_csr
 
-# ---------------------- Sessions ----------------------
+def stratified_split_by_part(
+    qids: List[str],
+    qid_to_part: Dict[str, str],
+    valid_ratio: float,
+    seed: int
+) -> Tuple[List[str], List[str]]:
+    return stratified_train_valid_split(qids, qid_to_part=qid_to_part, valid_ratio=valid_ratio, seed=seed)
 
-def load_sessions_or_build(
-    data_root: str,
-    q_ids: List[str],
-    Q_csr,
-    use_sessions: bool,
-    session_len: int,
-    train_qids: List[str],
-    nn_extra: int = 8,
-    nn_batch: int = 10000,
-    n_jobs: int = 4,
-) -> Dict[str, List[str]]:
-    """
-    If sessions.json exists: use it.
-    Else: build pseudo sessions by NN among train questions in TF-IDF space.
-    """
-    sess_path = os.path.join(data_root, "sessions.json")
-    if use_sessions and os.path.exists(sess_path):
-        try:
-            raw = load_json(sess_path)
-            out = {}
-            for it in raw:
-                qid = it.get("qid"); hist = it.get("history", [])
-                if qid in q_ids:
-                    out[qid] = hist[-session_len:]
-            return out
-        except Exception:
-            pass
+from collections import defaultdict
+def sample_qids_by_part(
+    qids: List[str],
+    qid_to_part: Dict[str, str],
+    per_part: int,
+    seed: int,
+    parts: Optional[List[str]] = None
+) -> List[str]:
+    if per_part <= 0:
+        return list(qids)
 
-    if not train_qids or session_len <= 0:
-        return {qid: [] for qid in q_ids}
+    rng = random.Random(seed)
+    buckets = defaultdict(list)
+    for q in qids:
+        buckets[qid_to_part.get(q, "Unknown")].append(q)
 
-    from scipy.sparse import issparse
-    if not issparse(Q_csr):
-        raise ValueError("Q_csr must be scipy.sparse CSR/CSC.")
+    if parts is None:
+        parts = sorted(buckets.keys())
 
-    Qn = normalize(Q_csr.tocsr().astype(np.float32), norm="l2", axis=1, copy=True)
+    out = []
+    for p in parts:
+        lst = buckets.get(p, [])
+        rng.shuffle(lst)
+        out.extend(lst[: min(per_part, len(lst))])
 
-    qid2idx = {qid: i for i, qid in enumerate(q_ids)}
-    train_idx = np.array([qid2idx[q] for q in train_qids if q in qid2idx], dtype=np.int64)
-    if train_idx.size == 0:
-        return {qid: [] for qid in q_ids}
-
-    k_query = min(session_len + nn_extra, train_idx.size)
-    nbrs = NearestNeighbors(
-        n_neighbors=k_query,
-        metric="cosine",
-        algorithm="brute",
-        n_jobs=n_jobs
-    ).fit(Qn[train_idx])
-
-    out = {}
-    N = len(q_ids)
-    for s in range(0, N, nn_batch):
-        e = min(s + nn_batch, N)
-        dist, idx_local = nbrs.kneighbors(Qn[s:e], return_distance=True)
-        idx_global = train_idx[idx_local]
-
-        for i, qrow in enumerate(range(s, e)):
-            qid = q_ids[qrow]
-            cand = idx_global[i].tolist()
-            hist = []
-            seen = set()
-            for gidx in cand:
-                if gidx == qrow:
-                    continue
-                qh = q_ids[gidx]
-                if qh in seen:
-                    continue
-                seen.add(qh)
-                hist.append(qh)
-                if len(hist) >= session_len:
-                    break
-            out[qid] = hist
-
-    for qid in q_ids:
-        out.setdefault(qid, [])
+    rng.shuffle(out)
     return out
 
-# ---------------------- Metrics ----------------------
+def dataset_signature(a_ids: List[str], all_rankings: Dict[str, List[str]]) -> str:
+    payload = {"a_ids": a_ids, "rankings": {k: all_rankings[k] for k in sorted(all_rankings.keys())}}
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    sig = zlib.crc32(blob) & 0xFFFFFFFF
+    return f"{sig:08x}"
+
+
+# ---------------------- metrics ----------------------
 
 def _dcg_at_k(binary_hits, k):
     dcg = 0.0
@@ -276,7 +192,8 @@ def evaluate_sampled(pred_ids_topk: List[str], rel_set: set, ks=(5, 10, 50)):
         out[k] = {"P":P, "R":R, "F1":F1, "Hit":Hit, "nDCG":nDCG, "MRR":rr}
     return out
 
-# ---------------------- Vocab ----------------------
+
+# ---------------------- vocab ----------------------
 
 class AgentVocab:
     def __init__(self, a_ids: List[str]):
@@ -285,13 +202,17 @@ class AgentVocab:
         self.vocab_size = len(a_ids) + self.offset
         self.aid2tok = {aid: i + self.offset for i, aid in enumerate(a_ids)}
         self.tok2aid = {i + self.offset: aid for i, aid in enumerate(a_ids)}
+
     def aid_to_token(self, aid: str) -> int:
         return self.aid2tok[aid]
+
     def token_to_aid(self, tok: int) -> Optional[str]:
-        if tok < self.offset: return None
+        if tok < self.offset:
+            return None
         return self.tok2aid.get(tok, None)
 
-# ---------------------- Remap CE targets ----------------------
+
+# ---------------------- candidate remap ----------------------
 
 def remap_targets_to_cand(
     tgt_tok: torch.Tensor,      # (B,L) full-vocab token ids
@@ -299,10 +220,6 @@ def remap_targets_to_cand(
     pad_tok: int = 0,
     ignore_index: int = -100
 ) -> torch.Tensor:
-    """
-    Return local indices in [0..C-1], else ignore_index.
-    This uses broadcasting match (B,L,C) but is safe for typical B<=1024, L<=64, C<=2k.
-    """
     # (B,L,C)
     match = (tgt_tok.unsqueeze(-1) == cand_tok.unsqueeze(1))
     has = match.any(dim=-1)  # (B,L)
@@ -311,60 +228,62 @@ def remap_targets_to_cand(
     local = torch.where(tgt_tok == pad_tok, torch.full_like(local, ignore_index), local)
     return local
 
-# ---------------------- Models ----------------------
 
-class SessionEncoder(nn.Module):
-    """
-    Encodes (B, Lq, Dq) TF-IDF vectors into (B, H).
-    """
-    def __init__(self, d_q: int, vocab_size: int, tok_dim: int = 256, hidden: int = 512, n_heads: int = 8, n_layers: int = 2):
+# ---------------------- QueryEncoder ----------------------
+
+class QueryEncoder(nn.Module):
+    def __init__(self, d_q: int, hidden: int = 512, dropout: float = 0.1):
         super().__init__()
-        self.q_proj = nn.Linear(d_q, hidden)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden, nhead=n_heads, batch_first=True)
-        self.enc = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.tok_emb = nn.Embedding(vocab_size, tok_dim)  # optional, currently unused unless you pass a_hist_tok
-        self.mix = nn.Linear(hidden + tok_dim, hidden)
-        self.norm = nn.LayerNorm(hidden)
-        for m in [self.q_proj, self.mix]:
-            nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
+        self.net = nn.Sequential(
+            nn.Linear(d_q, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+        )
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    def forward(self, q_hist_vec: torch.Tensor, a_hist_tok: Optional[torch.Tensor] = None):
-        hq = self.q_proj(q_hist_vec)   # (B,L,H)
-        h = self.enc(hq)               # (B,L,H)
-        h_last = h[:, -1]              # (B,H)
-        if a_hist_tok is not None:
-            ae = self.tok_emb(a_hist_tok).mean(dim=1)  # (B,E)
-            h_cat = torch.cat([h_last, ae], dim=1)
-            h_last = self.norm(torch.relu(self.mix(h_cat)))
-        return h_last
+    def forward(self, q_vec: torch.Tensor) -> torch.Tensor:
+        return self.net(q_vec)
 
-class OneRecPlus(nn.Module):
+
+# ---------------------- Generator (GRU) ----------------------
+
+class OneRecPlusGRU(nn.Module):
     """
-    Generator with tied token embeddings. Supports candidate-only logits.
+    Generator with tied token embeddings. Supports candidate-only logits (B,L,C).
+    Also includes a_proj for InfoNCE: tok_dim -> enc_dim.
     """
     def __init__(self, enc_dim: int, vocab_size: int, hidden: int = 512, num_layers: int = 2, tok_dim: int = 256):
         super().__init__()
         self.hidden = hidden
         self.num_layers = num_layers
         self.vocab_size = vocab_size
+        self.tok_dim = tok_dim
+        self.enc_dim = enc_dim
+
         self.tok_emb = nn.Embedding(vocab_size, tok_dim)
         self.enc_to_h = nn.Linear(enc_dim, hidden)
         self.dec = nn.GRU(input_size=tok_dim, hidden_size=hidden, num_layers=num_layers, batch_first=True)
         self.bridge = nn.Linear(hidden, tok_dim, bias=False)
 
+        # for InfoNCE
+        self.a_proj = nn.Linear(tok_dim, enc_dim, bias=False)
+
         nn.init.xavier_uniform_(self.tok_emb.weight)
         nn.init.xavier_uniform_(self.enc_to_h.weight); nn.init.zeros_(self.enc_to_h.bias)
         nn.init.xavier_uniform_(self.bridge.weight)
+        nn.init.xavier_uniform_(self.a_proj.weight)
 
         with torch.no_grad():
-            self.tok_emb.weight.data[0].zero_()
-            self.tok_emb.weight.data[1].zero_()
+            self.tok_emb.weight.data[0].zero_()  # PAD
+            self.tok_emb.weight.data[1].zero_()  # BOS
 
     def forward(self, enc_vec: torch.Tensor, tgt_inp_tok: torch.Tensor, cand_tok: torch.Tensor):
-        """
-        cand_tok: (B,C) candidate token ids
-        returns logits: (B,L,C)
-        """
         B, L = tgt_inp_tok.shape
         h0 = self.enc_to_h(enc_vec).unsqueeze(0).repeat(self.num_layers, 1, 1)
         x = self.tok_emb(tgt_inp_tok)   # (B,L,E)
@@ -376,9 +295,6 @@ class OneRecPlus(nn.Module):
 
     @torch.no_grad()
     def generate(self, enc_vec: torch.Tensor, topk: int, cand_tok: torch.Tensor, temperature: float = 0.0):
-        """
-        Candidate-only generation: only rank/select within cand_tok (B,C).
-        """
         was_training = self.training
         self.eval()
         try:
@@ -388,17 +304,16 @@ class OneRecPlus(nn.Module):
 
             C = cand_tok.size(1)
             used_c = torch.zeros((B, C), dtype=torch.bool, device=enc_vec.device)
-            used_c |= (cand_tok < 2)  # mask PAD/BOS if present
+            used_c |= (cand_tok < 2)
 
-            # precompute candidate embeddings once
             Wc = self.tok_emb(cand_tok)  # (B,C,E)
 
             out_tokens = []
             for _ in range(topk):
                 x = self.tok_emb(prev)
                 o, h = self.dec(x, h)
-                z = self.bridge(o[:, -1])                 # (B,E)
-                logits = torch.einsum("be,bce->bc", z, Wc)  # (B,C)
+                z = self.bridge(o[:, -1])                  # (B,E)
+                logits = torch.einsum("be,bce->bc", z, Wc) # (B,C)
                 logits = logits.masked_fill(used_c, float("-inf"))
 
                 if temperature and temperature > 0:
@@ -416,7 +331,169 @@ class OneRecPlus(nn.Module):
         finally:
             self.train(was_training)
 
-# ---------------------- Agent token init (optional) ----------------------
+
+# ---------------------- Generator (Transformer) ----------------------
+
+class OneRecPlusTransformer(nn.Module):
+    """
+    Transformer decoder-style (implemented via causal TransformerEncoder) with tied token embeddings.
+    Candidate-only logits (B,L,C). Includes a_proj for InfoNCE.
+    """
+    def __init__(
+        self,
+        enc_dim: int,
+        vocab_size: int,
+        hidden: int = 512,
+        n_heads: int = 8,
+        n_layers: int = 2,
+        tok_dim: int = 256,
+        max_len: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.enc_dim = enc_dim
+        self.tok_dim = tok_dim
+        self.hidden = hidden
+        self.max_len = max_len
+
+        self.tok_emb = nn.Embedding(vocab_size, tok_dim)
+        self.pos_emb = nn.Embedding(max_len, tok_dim)
+
+        self.cond = nn.Linear(enc_dim, tok_dim, bias=False)
+        self.in_proj = nn.Linear(tok_dim, hidden)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=n_heads,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.dec = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.bridge = nn.Linear(hidden, tok_dim, bias=False)
+
+        # for InfoNCE
+        self.a_proj = nn.Linear(tok_dim, enc_dim, bias=False)
+
+        nn.init.xavier_uniform_(self.tok_emb.weight)
+        nn.init.xavier_uniform_(self.pos_emb.weight)
+        nn.init.xavier_uniform_(self.cond.weight)
+        nn.init.xavier_uniform_(self.in_proj.weight); nn.init.zeros_(self.in_proj.bias)
+        nn.init.xavier_uniform_(self.bridge.weight)
+        nn.init.xavier_uniform_(self.a_proj.weight)
+
+        with torch.no_grad():
+            self.tok_emb.weight.data[0].zero_()
+            self.tok_emb.weight.data[1].zero_()
+
+    def _causal_mask(self, L: int, device):
+        m = torch.full((L, L), float("-inf"), device=device)
+        m = torch.triu(m, diagonal=1)
+        return m
+
+    def forward(self, enc_vec: torch.Tensor, tgt_inp_tok: torch.Tensor, cand_tok: torch.Tensor):
+        B, L = tgt_inp_tok.shape
+        if L > self.max_len:
+            raise ValueError(f"Sequence length L={L} exceeds max_len={self.max_len}. Increase --max_len.")
+
+        pos = torch.arange(L, device=tgt_inp_tok.device).unsqueeze(0)  # (1,L)
+        x = self.tok_emb(tgt_inp_tok) + self.pos_emb(pos)              # (B,L,E)
+        x = x + self.cond(enc_vec).unsqueeze(1)                        # (B,L,E)
+        h = self.in_proj(x)                                            # (B,L,H)
+
+        attn_mask = self._causal_mask(L, device=h.device)              # (L,L)
+        h = self.dec(h, mask=attn_mask)                                # (B,L,H)
+
+        z = self.bridge(h)                                             # (B,L,E)
+        Wc = self.tok_emb(cand_tok)                                    # (B,C,E)
+        logits_c = torch.einsum("ble,bce->blc", z, Wc)                 # (B,L,C)
+        return logits_c
+
+    @torch.no_grad()
+    def generate(self, enc_vec: torch.Tensor, topk: int, cand_tok: torch.Tensor, temperature: float = 0.0):
+        was_training = self.training
+        self.eval()
+        try:
+            B = enc_vec.size(0)
+            C = cand_tok.size(1)
+            used_c = torch.zeros((B, C), dtype=torch.bool, device=enc_vec.device)
+            used_c |= (cand_tok < 2)
+
+            out_tokens = []
+            for step in range(topk):
+                if step == 0:
+                    inp = torch.full((B, 1), 1, dtype=torch.long, device=enc_vec.device)  # BOS
+                else:
+                    bos = torch.full((B, 1), 1, dtype=torch.long, device=enc_vec.device)
+                    inp = torch.cat([bos, torch.stack(out_tokens, dim=1)], dim=1)         # (B, step+1)
+
+                logits_all = self(enc_vec, inp, cand_tok=cand_tok)       # (B, step+1, C)
+                logits = logits_all[:, -1].masked_fill(used_c, float("-inf"))
+
+                if temperature and temperature > 0:
+                    probs = F.softmax(logits / temperature, dim=-1)
+                    next_pos = torch.multinomial(probs, 1).squeeze(1)
+                else:
+                    next_pos = torch.argmax(logits, dim=-1)
+
+                next_tok = cand_tok.gather(1, next_pos.unsqueeze(1)).squeeze(1)
+                out_tokens.append(next_tok)
+                used_c.scatter_(1, next_pos.unsqueeze(1), True)
+
+            return torch.stack(out_tokens, dim=1)
+        finally:
+            self.train(was_training)
+
+
+# ---------------------- InfoNCE (multi-positive, in-batch negatives) ----------------------
+
+def info_nce_multi_pos(
+    q_emb: torch.Tensor,            # (B, H)
+    pos_tok: torch.Tensor,          # (B, K) full-vocab tokens, PAD=0
+    tok_emb: nn.Embedding,          # gen.tok_emb
+    a_proj: nn.Linear,              # tok_dim -> H
+    temperature: float = 0.07,
+    pad_tok: int = 0,
+):
+    """
+    In-batch negatives: pool = all positives from all samples in batch.
+    Multi-positive for each query: numerator is logsumexp over its positives.
+    """
+    B, K = pos_tok.shape
+    pos_mask = (pos_tok != pad_tok) & (pos_tok >= 2)     # (B,K)
+
+    flat_tok = pos_tok.reshape(-1)
+    flat_mask = pos_mask.reshape(-1)
+
+    if flat_mask.sum().item() == 0:
+        return q_emb.new_zeros(())
+
+    pool_tok = flat_tok[flat_mask]                        # (M,)
+    a_pool = a_proj(tok_emb(pool_tok))                    # (M,H)
+    a_pool = F.normalize(a_pool, dim=-1)
+
+    q = F.normalize(q_emb, dim=-1)                        # (B,H)
+    logits = (q @ a_pool.t()) / temperature               # (B,M)
+
+    # Build (B,M) positive mask by token match, safe for typical B<=1024, K<=50
+    match = (pos_tok.unsqueeze(-1) == pool_tok.view(1, 1, -1)) & pos_mask.unsqueeze(-1)
+    pos_any = match.any(dim=1)                            # (B,M)
+
+    has_pos = pos_any.any(dim=1)                          # (B,)
+    if has_pos.sum().item() == 0:
+        return q_emb.new_zeros(())
+
+    log_denom = torch.logsumexp(logits, dim=1)            # (B,)
+    logits_pos = logits.masked_fill(~pos_any, float("-inf"))
+    log_num = torch.logsumexp(logits_pos, dim=1)          # (B,)
+
+    loss = -(log_num - log_denom)
+    loss = loss[has_pos].mean()
+    return loss
+
+
+# ---------------------- Optional: Agent token init (BGE + IDs) ----------------------
 
 class AgentTokenComposer(nn.Module):
     """
@@ -454,14 +531,8 @@ def init_tok_emb_from_bge_plus_ids(
     init_chunk: int = 50000,
     use_fp16: bool = True,
 ):
-    """
-    Fixes:
-      - tool pad length fixed to max_tool_per_agent (default 8)
-      - chunked initialization to avoid OOM (no full Na tensors on GPU)
-    """
     cache = load_feature_cache(feature_dir)
 
-    # content vectors (CPU numpy)
     A_content_np = build_agent_content_view(
         cache=cache,
         use_model_content_vector=True,
@@ -471,20 +542,16 @@ def init_tok_emb_from_bge_plus_ids(
     cache_a_ids = cache.a_ids
     idx_map = {aid: i for i, aid in enumerate(cache_a_ids)}
 
-    # raw padded tool arrays from cache (CPU numpy / memmap likely)
-    tool_pad = cache.agent_tool_idx_padded    # (Na_cache, T_cache)
-    tool_msk = cache.agent_tool_mask          # (Na_cache, T_cache)
-    llm_idx  = cache.agent_llm_idx            # (Na_cache,)
+    tool_pad = cache.agent_tool_idx_padded
+    tool_msk = cache.agent_tool_mask
+    llm_idx  = cache.agent_llm_idx
 
-    # ---- align to current a_ids on CPU ----
     Na = len(a_ids)
     d_content = A_content_np.shape[1]
 
-    # IMPORTANT: do NOT allocate huge GPU tensors here.
     A_aligned = np.zeros((Na, d_content), dtype=np.float32)
     llm_idx_aligned = np.zeros((Na,), dtype=np.int64)
 
-    # fixed tool pad length = 8
     T = int(max_tool_per_agent)
     tool_pad_aligned = np.zeros((Na, T), dtype=np.int64)
     tool_msk_aligned = np.zeros((Na, T), dtype=np.float32)
@@ -498,17 +565,8 @@ def init_tok_emb_from_bge_plus_ids(
         A_aligned[i] = A_content_np[j]
         llm_idx_aligned[i] = int(llm_idx[j])
 
-        # truncate/pad to T=8 (keep order)
-        tp = np.asarray(tool_pad[j], dtype=np.int64)
-        tm = np.asarray(tool_msk[j], dtype=np.float32)
-
-        if tp.ndim != 1:
-            tp = tp.reshape(-1)
-        if tm.ndim != 1:
-            tm = tm.reshape(-1)
-
-        tp = tp[:T]
-        tm = tm[:T]
+        tp = np.asarray(tool_pad[j], dtype=np.int64).reshape(-1)[:T]
+        tm = np.asarray(tool_msk[j], dtype=np.float32).reshape(-1)[:T]
         tool_pad_aligned[i, :len(tp)] = tp
         tool_msk_aligned[i, :len(tm)] = tm
 
@@ -523,13 +581,11 @@ def init_tok_emb_from_bge_plus_ids(
         d_content=d_content, num_tools=num_tools, num_llm=num_llm, tok_dim=tok_dim, id_dim=256
     ).to(device)
 
-    # optional freeze tok embedding after init
     if freeze_tok:
         for p in gen.tok_emb.parameters():
             p.requires_grad = False
 
-    # ---- chunked init on GPU ----
-    was_training_gen = gen.training
+    was_training = gen.training
     gen.eval()
     composer.eval()
     dtype_ctx = torch.cuda.amp.autocast(enabled=(use_fp16 and device.type == "cuda"))
@@ -547,19 +603,15 @@ def init_tok_emb_from_bge_plus_ids(
                 with dtype_ctx:
                     E_agents = composer(A_t, tool_pad_t, tool_msk_t, llm_idx_t)  # (chunk, tok_dim)
 
-                # write into gen.tok_emb.weight
                 gen.tok_emb.weight.data[vocab.offset + s : vocab.offset + e] = E_agents.to(gen.tok_emb.weight.dtype)
-
-                # keep PAD/BOS zeros
                 gen.tok_emb.weight.data[vocab.PAD].zero_()
                 gen.tok_emb.weight.data[vocab.BOS].zero_()
 
-                # explicit free
                 del A_t, tool_pad_t, tool_msk_t, llm_idx_t, E_agents
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
     finally:
-        gen.train(was_training_gen)
+        gen.train(was_training)
         composer.train()
 
     print(f"[tok-init] done. tool_pad=T={T}, chunk={init_chunk}, fp16={use_fp16}")
@@ -572,7 +624,6 @@ class RewardModel(nn.Module):
     def __init__(self, enc_dim: int, tok_emb: nn.Embedding, hidden: int = 512, freeze_tok: bool = True):
         super().__init__()
         if freeze_tok:
-            # snapshot the embedding space used to pretrain RM to avoid drift during DPO finetune
             self.tok_emb = nn.Embedding.from_pretrained(tok_emb.weight.detach().clone(), freeze=True)
         else:
             self.tok_emb = tok_emb
@@ -595,25 +646,20 @@ class RewardModel(nn.Module):
         return self.ff(x).squeeze(1)
 
 class DPOTrainer:
-    def __init__(self, model: OneRecPlus, ref_model: OneRecPlus, rm: RewardModel, beta: float = 0.1, pad_tok: int = 0):
+    def __init__(self, model, ref_model, beta: float = 0.1, pad_tok: int = 0):
         self.model = model
         self.ref_model = ref_model
-        self.rm = rm
         self.beta = beta
         self.pad_tok = pad_tok
 
-    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model: Optional[OneRecPlus] = None):
-        """
-        seq: (B,L) full-vocab token ids (agents)
-        cand_tok: (B,C)
-        """
+    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model=None):
         model = self.model if model is None else model
         B, L = seq.shape
         bos = torch.full((B, 1), 1, dtype=torch.long, device=seq.device)
         inp = torch.cat([bos, seq[:, :-1]], dim=1)  # teacher forcing input
 
-        logits_c = model(enc_vec, inp, cand_tok=cand_tok)      # (B,L,C)
-        lp = F.log_softmax(logits_c, dim=-1)                        # (B,L,C)
+        logits_c = model(enc_vec, inp, cand_tok=cand_tok)  # (B,L,C)
+        lp = F.log_softmax(logits_c, dim=-1)               # (B,L,C)
 
         local = remap_targets_to_cand(seq, cand_tok, pad_tok=self.pad_tok, ignore_index=-100)  # (B,L)
         local_safe = local.clamp_min(0)
@@ -624,10 +670,8 @@ class DPOTrainer:
         return lp_sum / token_counts
 
     def dpo_loss(self, enc_vec: torch.Tensor, pref_seq: torch.Tensor, nonpref_seq: torch.Tensor, cand_tok: torch.Tensor):
-        # policy log-prob
         lp_pref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok)
         lp_nonp = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok)
-        # frozen reference log-prob
         with torch.no_grad():
             lp_pref_ref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok, model=self.ref_model)
             lp_nonp_ref = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok, model=self.ref_model)
@@ -635,25 +679,12 @@ class DPOTrainer:
         logratio = (lp_pref - lp_pref_ref) - (lp_nonp - lp_nonp_ref)
         return -F.logsigmoid(self.beta * logratio).mean()
 
-# ---------------------- Split / signature ----------------------
-
-def train_valid_split(qids_in_rank, valid_ratio=0.2, seed=42):
-    rng = random.Random(seed)
-    q = list(qids_in_rank); rng.shuffle(q)
-    n_valid = int(len(q) * valid_ratio)
-    return q[n_valid:], q[:n_valid]
-
-def dataset_signature(a_ids: List[str], all_rankings: Dict[str, List[str]]) -> str:
-    payload = {"a_ids": a_ids, "rankings": {k: all_rankings[k] for k in sorted(all_rankings.keys())}}
-    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    sig = zlib.crc32(blob) & 0xFFFFFFFF
-    return f"{sig:08x}"
 
 # ---------------------- Evaluation (candidate-only) ----------------------
 
 @torch.no_grad()
 def evaluate_model_gen(
-    gen_model: OneRecPlus,
+    gen_model,
     enc_vecs_cpu: torch.Tensor,         # (Nq,H) on CPU
     qid2idx: Dict[str,int],
     a_ids: List[str],
@@ -711,9 +742,7 @@ def evaluate_model_gen(
         else:
             cand_ids = gt_list
 
-        # cand_tok: (1,C)  pad with PAD if needed
         cand_tok_list = [vocab.aid_to_token(a) for a in cand_ids]
-        # de-dup preserving order
         seen = set()
         cand_tok_u = []
         for t in cand_tok_list:
@@ -721,12 +750,14 @@ def evaluate_model_gen(
                 continue
             seen.add(t)
             cand_tok_u.append(t)
-        # ensure at least topk size
+
         while len(cand_tok_u) < max(ks):
             cand_tok_u.append(vocab.PAD)
+
         cand_tok_u = cand_tok_u[:cand_size] if len(cand_tok_u) > cand_size else cand_tok_u
         while len(cand_tok_u) < cand_size:
             cand_tok_u.append(vocab.PAD)
+
         cand_tok = torch.tensor([cand_tok_u], dtype=torch.long, device=device)
 
         qi = qid2idx[qid]
@@ -763,10 +794,12 @@ def evaluate_model_gen(
             agg[k][m] /= cnt
     return agg
 
-# ---------------------- Main ----------------------
+
+# ---------------------- main ----------------------
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--data_root", type=str, required=True)
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
@@ -774,60 +807,80 @@ def main():
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--topk", type=int, default=10)
     ap.add_argument("--valid_ratio", type=float, default=0.2)
     ap.add_argument("--split_seed", type=int, default=42)
 
-    ap.add_argument("--use_sessions", type=int, default=1)
-    ap.add_argument("--session_len", type=int, default=4)
+    # candidate building
+    ap.add_argument("--train_mask", type=int, default=1,
+                    help="1: use CPU TF-IDF retrieval as hard negatives; 0: random-only")
+    ap.add_argument("--candidate_size", type=int, default=200, help="C for training (>=topk)")
+    ap.add_argument("--cand_extra", type=int, default=32, help="extra neighbors retrieved before trimming")
+    ap.add_argument("--rand_neg_ratio", type=float, default=0.25,
+                    help="When train_mask=1: fraction of candidate slots (excluding GT) filled by random negatives [0..1]")
 
-    ap.add_argument("--train_mask", type=int, default=0,
-                    help="1: use CPU TF-IDF NN to build per-sample candidate set; 0: random negatives")
-    ap.add_argument("--candidate_size", type=int, default=200,
-                    help="candidate set size C (must be >= topk)")
-    ap.add_argument("--cand_extra", type=int, default=32,
-                    help="extra neighbors retrieved to allow dedup + GT insertion")
-    ap.add_argument("--eval_candidate_size", type=int, default=200,
-                    help="candidate set size for evaluation (sampled metrics)")
+    ap.add_argument("--eval_candidate_size", type=int, default=200)
 
-    ap.add_argument("--mode", choices=["gen","dpo"], default="gen")
-    ap.add_argument("--dpo_steps", type=int, default=1000)
-    ap.add_argument("--dpo_batch", type=int, default=64)
-    ap.add_argument("--beta", type=float, default=0.05)
-    ap.add_argument("--dpo_lr", type=float, default=None, help="Override LR for DPO; default = lr * 0.1")
+    # model
+    ap.add_argument("--enc_dim", type=int, default=512)
+    ap.add_argument("--tok_dim", type=int, default=256)
+    ap.add_argument("--decoder", choices=["tx", "gru"], default="tx")
+    ap.add_argument("--hidden", type=int, default=512)
+    ap.add_argument("--num_layers", type=int, default=2)
+    ap.add_argument("--n_heads", type=int, default=8)
+    ap.add_argument("--max_len", type=int, default=64)
+    ap.add_argument("--dropout", type=float, default=0.1)
 
-    ap.add_argument("--nn_extra", type=int, default=8)
-    ap.add_argument("--nn_batch", type=int, default=10000)
+    # InfoNCE
+    ap.add_argument("--use_nce", type=int, default=1)
+    ap.add_argument("--nce_lambda", type=float, default=0.1)
+    ap.add_argument("--nce_temp", type=float, default=0.07)
+
+    # AMP / perf
+    ap.add_argument("--amp", type=int, default=1)
+    ap.add_argument("--enc_chunk", type=int, default=1024)
     ap.add_argument("--nn_jobs", type=int, default=4)
 
-    ap.add_argument("--amp", type=int, default=1)
-    ap.add_argument("--enc_chunk", type=int, default=512)
-
+    # BGE init
     ap.add_argument("--bge_feature_dir", type=str, default=None)
     ap.add_argument("--init_tok_from_bge", type=int, default=1)
     ap.add_argument("--freeze_tok_emb", type=int, default=0)
-    ap.add_argument("--eval_per_part", type=int, default=200, help="Per-part eval cap. 0 = no per-part cap.")
-    ap.add_argument("--eval_parts", type=str, default="PartI,PartII,PartIII", help="Comma-separated part names to eval.")
-    
     ap.add_argument("--max_tool_per_agent", type=int, default=8)
     ap.add_argument("--tok_init_chunk", type=int, default=50000)
     ap.add_argument("--tok_init_fp16", type=int, default=1)
-    
-    ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--skip_eval", type=int, default=0, help="1 to skip validation (saves time)")
 
+    # eval sampling
+    ap.add_argument("--eval_per_part", type=int, default=200)
+    ap.add_argument("--eval_parts", type=str, default="PartI,PartII,PartIII")
+
+    # mode
+    ap.add_argument("--mode", choices=["gen", "dpo"], default="gen")
+
+    # dpo params
+    ap.add_argument("--dpo_steps", type=int, default=1000)
+    ap.add_argument("--dpo_batch", type=int, default=64)
+    ap.add_argument("--beta", type=float, default=0.05)
+    ap.add_argument("--dpo_lr", type=float, default=None)
+    ap.add_argument("--freeze_q_enc_dpo", type=int, default=1)
+
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--skip_eval", type=int, default=0)
 
     args = ap.parse_args()
     eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
 
     warn_if_topk_diff(args.topk, expected=EVAL_TOPK)
     set_global_seed(args.seed)
+
     device = torch.device(args.device)
     use_cuda = (device.type == "cuda")
     use_amp = bool(args.amp) and use_cuda
 
     if args.candidate_size < args.topk:
         raise ValueError(f"candidate_size ({args.candidate_size}) must be >= topk ({args.topk}).")
+    if not (0.0 <= args.rand_neg_ratio <= 1.0):
+        raise ValueError("--rand_neg_ratio must be in [0,1].")
 
     # ---------------- load data ----------------
     all_agents, all_questions, all_rankings, tools, qid_to_part = collect_data(args.data_root)
@@ -837,11 +890,8 @@ def main():
 
     # ---------------- TF-IDF ----------------
     q_vec, Q_csr = build_q_vectorizer(q_texts, args.max_features)
-
-    # For candidate retrieval: represent each agent in the SAME Q-space via q_vec.transform
     A_in_Q_csr = q_vec.transform(a_texts)  # (Na, Dq) sparse
 
-    # normalize on CPU once
     from scipy.sparse import issparse
     if not issparse(Q_csr) or not issparse(A_in_Q_csr):
         raise ValueError("Q_csr / A_in_Q_csr must be sparse matrices.")
@@ -849,8 +899,7 @@ def main():
     Qn = normalize(Q_csr.tocsr().astype(np.float32), norm="l2", axis=1, copy=True)
     Aq = normalize(A_in_Q_csr.tocsr().astype(np.float32), norm="l2", axis=1, copy=True)
 
-    # build agent retriever (CPU)
-    # NOTE: brute+cosine on CSR is stable; speed depends on Na.
+    # agent retriever (CPU)
     print("[retriever] fitting NearestNeighbors on agents (CPU)...")
     nbrsA = NearestNeighbors(
         n_neighbors=min(args.candidate_size + args.cand_extra, Aq.shape[0]),
@@ -863,8 +912,8 @@ def main():
     def retrieve_agent_topN_indices(qid_batch: List[str], k: int) -> np.ndarray:
         idx = np.array([qid2idx[q] for q in qid_batch], dtype=np.int64)
         k = min(k, Aq.shape[0])
-        dist, ind = nbrsA.kneighbors(Qn[idx], n_neighbors=k, return_distance=True)
-        return ind  # (B,k) agent indices in [0..Na-1]
+        _, ind = nbrsA.kneighbors(Qn[idx], n_neighbors=k, return_distance=True)
+        return ind  # (B,k) agent indices
 
     # ---------------- split ----------------
     qids_in_rank = [qid for qid in q_ids if qid in all_rankings]
@@ -875,65 +924,37 @@ def main():
         seed=args.split_seed
     )
 
-
-    # ---------------- sessions ----------------
-    sessions = load_sessions_or_build(
-        args.data_root, q_ids, Q_csr,
-        bool(args.use_sessions), args.session_len, train_qids,
-        nn_extra=args.nn_extra, nn_batch=args.nn_batch, n_jobs=args.nn_jobs
-    )
-
-    # dense Q tensor for session encoder input (CPU)
-    # if Q is huge for your setting, you can change this to on-demand densify rows.
-    Q_dense = Q_csr.toarray().astype(np.float32)
-    Q_t_cpu = torch.from_numpy(Q_dense).pin_memory()
-
-    # ---------------- build session tensors ----------------
-    def build_session_tensor(qid_batch: List[str]) -> torch.Tensor:
-        L = args.session_len if args.use_sessions else 1
-        B = len(qid_batch)
-        Dq = Q_t_cpu.shape[1]
-        out = torch.zeros((B, L, Dq), dtype=Q_t_cpu.dtype)
-        for i, qid in enumerate(qid_batch):
-            hist = sessions.get(qid, [])[-L:]
-            if not hist:
-                qi = qid2idx[qid]
-                out[i, -1] = Q_t_cpu[qi]
-            else:
-                start = L - len(hist)
-                for j, hq in enumerate(hist):
-                    if hq in qid2idx:
-                        out[i, start+j] = Q_t_cpu[qid2idx[hq]]
-                out[i, -1] = Q_t_cpu[qid2idx[qid]]
-        return out
-
-    def build_agent_hist_tokens(qid_batch: List[str]) -> Optional[torch.Tensor]:
-        return None
+    # ---------------- batch query tensor ----------------
+    def build_query_tensor(qid_batch: List[str]) -> torch.Tensor:
+        idx = np.array([qid2idx[q] for q in qid_batch], dtype=np.int64)
+        q_dense = Q_csr[idx].toarray().astype(np.float32)   # (B, Dq) only batch densify
+        return torch.from_numpy(q_dense)                    # CPU
 
     @torch.no_grad()
-    def encode_sessions_in_chunks(qid_batch: List[str], chunk: int = 512) -> torch.Tensor:
+    def encode_queries_in_chunks(qid_list: List[str], chunk: int) -> torch.Tensor:
         outs = []
-        sess_enc.eval()
-        for i in range(0, len(qid_batch), chunk):
-            qids_s = qid_batch[i:i+chunk]
-            h_cpu = build_session_tensor(qids_s)  # CPU
-            h = h_cpu.to(device, non_blocking=True)
-            enc = sess_enc(h, None).cpu()
+        q_enc.eval()
+        for i in range(0, len(qid_list), chunk):
+            qb = qid_list[i:i+chunk]
+            qx = build_query_tensor(qb).to(device, non_blocking=True)
+            enc = q_enc(qx).cpu()
             outs.append(enc)
         return torch.cat(outs, dim=0)
 
     # ---------------- models ----------------
-    sess_enc = SessionEncoder(
-        d_q=Q_t_cpu.shape[1],
-        vocab_size=vocab.vocab_size,
-        tok_dim=256, hidden=512, n_heads=8, n_layers=2
-    ).to(device)
+    q_enc = QueryEncoder(d_q=Q_csr.shape[1], hidden=args.enc_dim, dropout=args.dropout).to(device)
 
-    gen = OneRecPlus(
-        enc_dim=512,
-        vocab_size=vocab.vocab_size,
-        hidden=512, num_layers=2, tok_dim=256
-    ).to(device)
+    if args.decoder == "gru":
+        gen = OneRecPlusGRU(
+            enc_dim=args.enc_dim, vocab_size=vocab.vocab_size,
+            hidden=args.hidden, num_layers=args.num_layers, tok_dim=args.tok_dim
+        ).to(device)
+    else:
+        gen = OneRecPlusTransformer(
+            enc_dim=args.enc_dim, vocab_size=vocab.vocab_size,
+            hidden=args.hidden, n_heads=args.n_heads, n_layers=args.num_layers,
+            tok_dim=args.tok_dim, max_len=args.max_len, dropout=args.dropout
+        ).to(device)
 
     composer = None
     if args.init_tok_from_bge and args.bge_feature_dir:
@@ -945,13 +966,12 @@ def main():
             use_fp16=bool(args.tok_init_fp16),
         )
 
-
     if args.freeze_tok_emb:
         for p in gen.tok_emb.parameters():
             p.requires_grad = False
         print("[tok-init] frozen gen.tok_emb")
 
-    # ---------------- candidate builder ----------------
+    # ---------------- candidate builder (GT + hard + random) ----------------
     def build_cand_tok_batch(
         qid_batch: List[str],
         tgt_tok: torch.Tensor,              # (B,topk) full-vocab targets
@@ -959,22 +979,25 @@ def main():
     ) -> torch.Tensor:
         """
         Return cand_tok: (B,C) full-vocab token ids (agent tokens), padded with PAD.
-        Always inserts GT tokens (non-PAD) into candidate set.
+        Always inserts GT tokens first.
+        If use_retrieval:
+          - fill remaining with hard negatives from TF-IDF retrieval
+          - then fill a fraction with random negatives (rand_neg_ratio)
         """
         B = tgt_tok.size(0)
         C = args.candidate_size
         cand_list = []
 
+        top_idx = None
         if use_retrieval:
             k_ret = min(C + args.cand_extra, len(a_ids))
             top_idx = retrieve_agent_topN_indices(qid_batch, k=k_ret)  # (B,k_ret)
 
         for i in range(B):
-            gt = [t for t in tgt_tok[i].tolist() if t >= vocab.offset]  # filter PAD/BOS
+            gt = [t for t in tgt_tok[i].tolist() if t >= vocab.offset]
             gt_set = set(gt)
 
             cand = []
-            # put GT first (important for CE remap)
             for t in gt:
                 if t not in cand:
                     cand.append(t)
@@ -982,24 +1005,28 @@ def main():
                         break
 
             if len(cand) < C:
-                if use_retrieval:
-                    # add retrieved
+                rem = C - len(cand)
+                # decide how many random slots (excluding GT)
+                rand_slots = int(round(rem * args.rand_neg_ratio)) if use_retrieval else rem
+                hard_slots = rem - rand_slots
+
+                # hard negatives (retrieved)
+                if use_retrieval and hard_slots > 0:
                     for aidx in top_idx[i].tolist():
                         t = vocab.offset + int(aidx)
-                        if t in gt_set:
-                            # allowed but will dedup anyway
-                            pass
-                        if t not in cand:
-                            cand.append(t)
-                            if len(cand) >= C:
-                                break
-                else:
-                    # random negatives (avoid GT agent indices if possible)
-                    need = C - len(cand)
+                        if t in cand:
+                            continue
+                        cand.append(t)
+                        hard_slots -= 1
+                        if hard_slots <= 0 or len(cand) >= C:
+                            break
+
+                # random negatives
+                need = C - len(cand)
+                if need > 0:
                     forbid_agent = set([t - vocab.offset for t in gt if t >= vocab.offset])
-                    # rejection sampling
                     tries = 0
-                    while need > 0 and tries < need * 20:
+                    while need > 0 and tries < need * 50:
                         aidx = random.randrange(len(a_ids))
                         tries += 1
                         if aidx in forbid_agent:
@@ -1010,11 +1037,11 @@ def main():
                         cand.append(t)
                         need -= 1
 
-            # pad
             if len(cand) < C:
                 cand += [vocab.PAD] * (C - len(cand))
             else:
                 cand = cand[:C]
+
             cand_list.append(cand)
 
         return torch.tensor(cand_list, dtype=torch.long, device=device)
@@ -1035,7 +1062,7 @@ def main():
 
     train_q, train_targets = build_targets(train_qids)
     valid_q, valid_targets = build_targets(valid_qids)
-    print(f"[gen] train sequences={len(train_q)}  valid sequences={len(valid_q)}  topk={args.topk}")
+    print(f"[train] sequences={len(train_q)}  valid={len(valid_q)}  topk={args.topk}")
 
     # ---------------- checkpoints ----------------
     data_sig = dataset_signature(a_ids, all_rankings)
@@ -1045,21 +1072,22 @@ def main():
     meta_path = os.path.join(model_dir, f"meta_{data_sig}.json")
 
     # ---------------- optim / scaler ----------------
-    if args.mode == "gen":
-        params = list(sess_enc.parameters()) + list(gen.parameters())
-        if composer is not None:
-            # NOTE: composer currently only initializes tok_emb; it is not used in forward.
-            # We keep it out of optimizer to avoid "training dead params" confusion.
-            pass
+    def build_optimizer(params):
+        return torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
 
-        opt = torch.optim.Adam(params, lr=args.lr)
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # ===================== GEN =====================
+    if args.mode == "gen":
+        params = [p for p in list(q_enc.parameters()) + list(gen.parameters()) if p.requires_grad]
+        opt = build_optimizer(params)
 
         nb = math.ceil(len(train_q) / args.batch_size)
         for epoch in range(1, args.epochs+1):
             order = list(range(len(train_q))); random.shuffle(order)
-            total = 0.0
-            pbar = tqdm(range(nb), desc=f"Epoch {epoch}/{args.epochs} [GEN]")
+            total_ce = 0.0
+            total_nce = 0.0
+            pbar = tqdm(range(nb), desc=f"Epoch {epoch}/{args.epochs} [GEN/{args.decoder}]")
             for b in pbar:
                 sl = order[b*args.batch_size:(b+1)*args.batch_size]
                 if not sl:
@@ -1072,61 +1100,80 @@ def main():
                 bos = torch.full((B,1), vocab.BOS, dtype=torch.long, device=device)
                 inp = torch.cat([bos, tgt[:, :-1]], dim=1)  # (B,topk)
 
-                # session tensor (CPU->GPU)
-                q_hist = build_session_tensor(qid_batch).to(device, non_blocking=True)
-                a_hist = build_agent_hist_tokens(qid_batch)
-
-                # candidate set (B,C) in full-vocab token ids
+                q_x = build_query_tensor(qid_batch).to(device, non_blocking=True)  # (B,Dq)
                 cand_tok = build_cand_tok_batch(qid_batch, tgt_tok=tgt, use_retrieval=bool(args.train_mask))
 
                 opt.zero_grad(set_to_none=True)
+
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    enc_vec = sess_enc(q_hist, a_hist)                 # (B,H)
-                    logits_c = gen(enc_vec, inp, cand_tok=cand_tok)    # (B,L,C)
+                    enc_vec = q_enc(q_x)                              # (B,H)
+                    logits_c = gen(enc_vec, inp, cand_tok=cand_tok)   # (B,L,C)
+
                     tgt_local = remap_targets_to_cand(tgt, cand_tok, pad_tok=vocab.PAD, ignore_index=-100)
-                    loss = F.cross_entropy(
+                    loss_ce = F.cross_entropy(
                         logits_c.reshape(-1, logits_c.size(-1)),
                         tgt_local.reshape(-1),
                         ignore_index=-100
                     )
 
+                    if args.use_nce:
+                        loss_nce = info_nce_multi_pos(
+                            q_emb=enc_vec,
+                            pos_tok=tgt,
+                            tok_emb=gen.tok_emb,
+                            a_proj=gen.a_proj,
+                            temperature=args.nce_temp,
+                            pad_tok=vocab.PAD,
+                        )
+                        loss = loss_ce + args.nce_lambda * loss_nce
+                    else:
+                        loss_nce = enc_vec.new_zeros(())
+                        loss = loss_ce
+
                 scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(params, 1.0)
                 scaler.step(opt)
                 scaler.update()
 
-                total += loss.item()
-                pbar.set_postfix({"ce": f"{loss.item():.4f}", "avg": f"{total/(b+1):.4f}", "C": cand_tok.size(1)})
+                total_ce += float(loss_ce.detach().cpu())
+                total_nce += float(loss_nce.detach().cpu())
 
-            print(f"Epoch {epoch}: avg CE={total/max(1,nb):.4f}")
+                pbar.set_postfix({
+                    "ce": f"{loss_ce.item():.4f}",
+                    "nce": f"{loss_nce.item():.4f}",
+                    "avg_ce": f"{total_ce/(b+1):.4f}",
+                    "avg_nce": f"{total_nce/(b+1):.4f}",
+                    "C": cand_tok.size(1),
+                })
+
+            print(f"Epoch {epoch}: avg CE={total_ce/max(1,nb):.4f}  avg NCE={total_nce/max(1,nb):.4f}")
 
         # save
         ckpt = {
             "mode": "gen",
-            "sess_enc": sess_enc.state_dict(),
+            "decoder": args.decoder,
+            "q_enc": q_enc.state_dict(),
             "gen": gen.state_dict(),
             "data_sig": data_sig,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "dims": {"d_q": int(Q_t_cpu.shape[1]), "vocab_size": vocab.vocab_size}
+            "dims": {
+                "d_q": int(Q_csr.shape[1]),
+                "enc_dim": int(args.enc_dim),
+                "tok_dim": int(args.tok_dim),
+                "vocab_size": int(vocab.vocab_size),
+            }
         }
         torch.save(ckpt, model_path)
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump({"a_ids": a_ids, "q_ids": q_ids, "data_sig": data_sig}, f, ensure_ascii=False, indent=2)
         print(f"[save] model -> {model_path}\n[save] meta  -> {meta_path}")
 
-        # build full encodings (CPU)
+        # eval
         if not bool(args.skip_eval):
-            enc_all = []
-            bs = 2048
-            sess_enc.eval()
-            with torch.no_grad():
-                for i in range(0, len(q_ids), bs):
-                    qid_batch = q_ids[i:i+bs]
-                    enc_vec = encode_sessions_in_chunks(qid_batch, chunk=getattr(args, "enc_chunk", 512))
-                    enc_all.append(enc_vec.cpu())
-            enc_all = torch.cat(enc_all, dim=0)  # CPU
+            print("[eval] encoding all queries...")
+            enc_all = encode_queries_in_chunks(q_ids, chunk=args.enc_chunk)  # CPU (Nq,H)
 
-            # --- eval qids: per-part cap ---
-            eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
             eval_qids = sample_qids_by_part(
                 valid_qids,
                 qid_to_part=qid_to_part,
@@ -1136,7 +1183,6 @@ def main():
             )
             print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
 
-            # overall
             valid_metrics = evaluate_model_gen(
                 gen_model=gen,
                 enc_vecs_cpu=enc_all,
@@ -1150,9 +1196,8 @@ def main():
                 rng_seed=args.seed,
                 qid_to_part=qid_to_part,
             )
-            print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
+            print_metrics_table(f"Validation (GEN/{args.decoder}, per-part sampled)", valid_metrics, filename=filename)
 
-            # per-part
             for part in eval_parts:
                 part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
                 if not part_qids:
@@ -1167,68 +1212,61 @@ def main():
                     device=device,
                     ks=(5, 10, 50),
                     cand_size=args.eval_candidate_size,
-                    rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                    rng_seed=args.seed + 17,
                     qid_to_part=qid_to_part,
                 )
-                print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
+                print_metrics_table(f"Validation (GEN/{args.decoder}) {part} (n={len(part_qids)})", m_part, filename=filename)
 
-
-    # ---------------------- Lite-DPO finetune ----------------------
+    # ===================== DPO =====================
     if args.mode == "dpo":
         assert os.path.exists(model_path), f"CE checkpoint not found: {model_path}"
         ckpt = torch.load(model_path, map_location=device)
-        sess_enc.load_state_dict(ckpt["sess_enc"])
+
+        # decoder mismatch check (soft)
+        print(f"[load] ckpt decoder={ckpt.get('decoder','?')}  current decoder={args.decoder}")
+
+        q_enc.load_state_dict(ckpt["q_enc"])
         gen.load_state_dict(ckpt["gen"])
 
-        # reference policy (frozen snapshot of CE model)
+        # reference policy snapshot
         gen_ref = copy.deepcopy(gen).to(device)
         gen_ref.eval()
         for p in gen_ref.parameters():
             p.requires_grad = False
 
-        rm = RewardModel(enc_dim=512, tok_emb=gen.tok_emb, hidden=512, freeze_tok=True).to(device)
-        dpo = DPOTrainer(model=gen, ref_model=gen_ref, rm=rm, beta=args.beta, pad_tok=vocab.PAD)
+        rm = RewardModel(enc_dim=args.enc_dim, tok_emb=gen.tok_emb, hidden=512, freeze_tok=True).to(device)
+        dpo = DPOTrainer(model=gen, ref_model=gen_ref, beta=args.beta, pad_tok=vocab.PAD)
 
         scaler_rm = torch.cuda.amp.GradScaler(enabled=use_amp)
         scaler_dpo = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-        # RM pretrain: GT list > (generated lists & random lists)
+        # RM pretrain
+        # Use the SAME filtered training set as SFT (only queries with valid GT)
+        dpo_q = train_q
+        dpo_tgt = train_targets
+        assert len(dpo_q) == len(dpo_tgt) and len(dpo_q) > 0
+
         print("[RM] Pretraining reward model...")
-        opt_rm = torch.optim.Adam(rm.parameters(), lr=args.lr)
-        rm_steps = max(500, args.dpo_steps//4)
-        rm_batch = args.dpo_batch
+        opt_rm = torch.optim.AdamW(rm.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        rm_steps = max(500, args.dpo_steps // 4)
         train_pool = [qid for qid in train_qids if qid in qid2idx]
 
         for step in tqdm(range(rm_steps), desc="RM pretrain"):
-            batch_q = random.sample(train_pool, min(rm_batch, len(train_pool)))
-            # build GT token sequences
-            gt_tok = []
-            for q in batch_q:
-                ranked = [aid for aid in all_rankings.get(q, [])[:args.topk] if aid in vocab.aid2tok]
-                if not ranked:
-                    # fallback
-                    k = min(args.topk, len(a_ids))
-                    ranked = random.sample(a_ids, k=k)
-                gt = [vocab.aid_to_token(a) for a in ranked]
-                if len(gt) < args.topk:
-                    gt += [vocab.PAD] * (args.topk - len(gt))
-                gt_tok.append(gt)
-            gt_tok = torch.tensor(gt_tok, dtype=torch.long, device=device)
+            sl = random.sample(range(len(dpo_q)), min(args.dpo_batch, len(dpo_q)))
+            batch_q = [dpo_q[i] for i in sl]
+            gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
 
-            # candidate set for generation (use retrieval if enabled, else random)
             cand_tok = build_cand_tok_batch(batch_q, tgt_tok=gt_tok, use_retrieval=bool(args.train_mask))
+            q_x = build_query_tensor(batch_q).to(device, non_blocking=True)
 
-            q_hist = build_session_tensor(batch_q).to(device, non_blocking=True)
             opt_rm.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                enc = sess_enc(q_hist, build_agent_hist_tokens(batch_q))
+                enc = q_enc(q_x)
                 seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=0.7)
                 seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
 
-                # random list
                 rnd_tok = []
                 for _ in batch_q:
-                    # sample random agents, pad to topk
                     kk = args.topk
                     ids = [vocab.offset + random.randrange(len(a_ids)) for _ in range(kk)]
                     rnd_tok.append(ids)
@@ -1246,6 +1284,8 @@ def main():
                 ).mean()
 
             scaler_rm.scale(loss_rm).backward()
+            scaler_rm.unscale_(opt_rm)
+            torch.nn.utils.clip_grad_norm_(rm.parameters(), 1.0)
             scaler_rm.step(opt_rm)
             scaler_rm.update()
 
@@ -1254,36 +1294,30 @@ def main():
         for p in rm.parameters():
             p.requires_grad = False
 
-        # Freeze session encoder for stability (optional)
-        for p in sess_enc.parameters():
-            p.requires_grad = False
+        # optionally freeze query encoder during DPO
+        if args.freeze_q_enc_dpo:
+            for p in q_enc.parameters():
+                p.requires_grad = False
+            q_enc.eval()
+            print("[DPO] frozen q_enc for stability.")
+        else:
+            q_enc.train()
 
         lr_dpo = args.dpo_lr if args.dpo_lr is not None else args.lr * 0.1
-        opt_dpo = torch.optim.Adam([p for p in gen.parameters() if p.requires_grad], lr=lr_dpo)
+        opt_dpo = torch.optim.AdamW([p for p in gen.parameters() if p.requires_grad], lr=lr_dpo, weight_decay=args.weight_decay)
 
-        dpo_steps = args.dpo_steps
-        dpo_batch = args.dpo_batch
-
-        for step in tqdm(range(dpo_steps), desc="Lite-DPO"):
-            batch_q = random.sample(train_pool, min(dpo_batch, len(train_pool)))
-
-            # build GT token sequences for candidate insertion
-            gt_tok = []
-            for q in batch_q:
-                ranked = [aid for aid in all_rankings.get(q, [])[:args.topk] if aid in vocab.aid2tok]
-                if not ranked:
-                    ranked = random.sample(a_ids, k=min(args.topk, len(a_ids)))
-                gt = [vocab.aid_to_token(a) for a in ranked]
-                if len(gt) < args.topk:
-                    gt += [vocab.PAD] * (args.topk - len(gt))
-                gt_tok.append(gt)
-            gt_tok = torch.tensor(gt_tok, dtype=torch.long, device=device)
+        update_steps = 0
+        skipped_keep = 0
+        for step in tqdm(range(args.dpo_steps), desc="Lite-DPO"):
+            sl = random.sample(range(len(dpo_q)), min(args.dpo_batch, len(dpo_q)))
+            batch_q = [dpo_q[i] for i in sl]
+            gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
 
             cand_tok = build_cand_tok_batch(batch_q, tgt_tok=gt_tok, use_retrieval=bool(args.train_mask))
+            q_x = build_query_tensor(batch_q).to(device, non_blocking=True)
 
-            q_hist = build_session_tensor(batch_q).to(device, non_blocking=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                enc = sess_enc(q_hist, build_agent_hist_tokens(batch_q))
+                enc = q_enc(q_x)
                 seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=0.7)
                 seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
 
@@ -1291,15 +1325,17 @@ def main():
                 r_a = rm(enc, seq_a)
                 r_b = rm(enc, seq_b)
                 prefer_a = (r_a >= r_b)
-                margin = 0.05
+                margin = 0.01
                 keep = (r_a - r_b).abs() >= margin
                 if keep.sum().item() == 0:
+                    skipped_keep += 1
+                    if (step + 1) % 100 == 0:
+                        tqdm.write(f"[DPO] step {step+1}: skip (keep=0) skipped_keep={skipped_keep} update_steps={update_steps}")
                     continue
 
             pref_seq = torch.where(prefer_a.unsqueeze(1), seq_a, seq_b)
             nonpref_seq = torch.where(prefer_a.unsqueeze(1), seq_b, seq_a)
 
-            # keep filtered
             pref_seq = pref_seq[keep]
             nonpref_seq = nonpref_seq[keep]
             enc_keep = enc[keep]
@@ -1316,12 +1352,15 @@ def main():
             scaler_dpo.step(opt_dpo)
             scaler_dpo.update()
 
-            if (step+1) % 100 == 0:
-                print(f"[DPO] step {step+1}/{dpo_steps} loss={loss.item():.4f}")
+            update_steps += 1
+            if update_steps % 100 == 0:
+                tqdm.write(f"[DPO] update {update_steps} (step {step+1}/{args.dpo_steps}) loss={loss.item():.4f} skipped_keep={skipped_keep}")
+
 
         ckpt_out = {
             "mode": "gen+dpo",
-            "sess_enc": sess_enc.state_dict(),
+            "decoder": args.decoder,
+            "q_enc": q_enc.state_dict(),
             "gen": gen.state_dict(),
             "data_sig": data_sig,
             "saved_at": datetime.now().isoformat(timespec="seconds")
@@ -1331,62 +1370,52 @@ def main():
         print(f"[save] dpo model -> {out_path}")
 
         # quick eval
-        enc_all = []
-        bs = 2048
-        sess_enc.eval()
-        with torch.no_grad():
-            for i in range(0, len(q_ids), bs):
-                qid_batch = q_ids[i:i+bs]
-                enc_vec = encode_sessions_in_chunks(qid_batch, chunk=getattr(args, "enc_chunk", 512))
-                enc_all.append(enc_vec.cpu())
-        enc_all = torch.cat(enc_all, dim=0)
+        if not bool(args.skip_eval):
+            print("[eval] encoding all queries...")
+            enc_all = encode_queries_in_chunks(q_ids, chunk=args.enc_chunk)
 
-        # --- eval qids: per-part cap ---
-        eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
-        eval_qids = sample_qids_by_part(
-            valid_qids,
-            qid_to_part=qid_to_part,
-            per_part=args.eval_per_part,
-            seed=args.seed,
-            parts=eval_parts
-        )
-        print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
+            eval_qids = sample_qids_by_part(
+                valid_qids,
+                qid_to_part=qid_to_part,
+                per_part=args.eval_per_part,
+                seed=args.seed,
+                parts=eval_parts
+            )
+            print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
 
-        # overall
-        valid_metrics = evaluate_model_gen(
-            gen_model=gen,
-            enc_vecs_cpu=enc_all,
-            qid2idx=qid2idx,
-            a_ids=a_ids,
-            all_rankings=all_rankings,
-            eval_qids=eval_qids,
-            device=device,
-            ks=(5, 10, 50),
-            cand_size=args.eval_candidate_size,
-            rng_seed=args.seed,
-            qid_to_part=qid_to_part,
-        )
-        print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
-
-        # per-part
-        for part in eval_parts:
-            part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
-            if not part_qids:
-                continue
-            m_part = evaluate_model_gen(
+            valid_metrics = evaluate_model_gen(
                 gen_model=gen,
                 enc_vecs_cpu=enc_all,
                 qid2idx=qid2idx,
                 a_ids=a_ids,
                 all_rankings=all_rankings,
-                eval_qids=part_qids,
+                eval_qids=eval_qids,
                 device=device,
                 ks=(5, 10, 50),
                 cand_size=args.eval_candidate_size,
-                rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                rng_seed=args.seed,
                 qid_to_part=qid_to_part,
             )
-            print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
+            print_metrics_table(f"Validation (GEN/{args.decoder}+DPO, per-part sampled)", valid_metrics, filename=filename)
+
+            for part in eval_parts:
+                part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
+                if not part_qids:
+                    continue
+                m_part = evaluate_model_gen(
+                    gen_model=gen,
+                    enc_vecs_cpu=enc_all,
+                    qid2idx=qid2idx,
+                    a_ids=a_ids,
+                    all_rankings=all_rankings,
+                    eval_qids=part_qids,
+                    device=device,
+                    ks=(5, 10, 50),
+                    cand_size=args.eval_candidate_size,
+                    rng_seed=args.seed + 17,
+                    qid_to_part=qid_to_part,
+                )
+                print_metrics_table(f"Validation (GEN/{args.decoder}+DPO) {part} (n={len(part_qids)})", m_part, filename=filename)
 
 
 if __name__ == "__main__":
