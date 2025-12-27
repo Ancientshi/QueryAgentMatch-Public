@@ -42,8 +42,8 @@ def _normalize_token(token: str) -> str:
 
 class GenerativeStructuredRecommender:
     """
-    Lightweight generative-style recommender that produces structured token
-    outputs like::
+    Lightweight (inference-only) generative-style recommender that produces
+    structured token outputs like::
 
         <LLM_TOKEN> <TOOL_SEP> <TOOL_A> <TOOL_B> <SPECIAL_END>
 

@@ -34,6 +34,11 @@ Notes:
 
 ## Run (Generative structured recommender)
 
+This entrypoint is **inference-only** (no training happens here). It fits a TF-IDF
+retriever on the provided data each run, then formats structured token outputs
+for a query. You can also export supervised pairs for training an external
+seq2seq model.
+
 Generate structured token outputs (LLM + tools) for a query:
 
 ```bash
@@ -51,6 +56,18 @@ python run_generative.py \
   --data_root /path/to/dataset_root \
   --export_pairs /tmp/generative_pairs.jsonl \
   --max_examples 5000
+```
+
+Fine-tune a seq2seq model (e.g., T5) on those supervised pairs directly from the
+benchmark data:
+
+```bash
+python run_generative_train.py \
+  --data_root /path/to/dataset_root \
+  --output_dir /tmp/generative_t5_ckpt \
+  --model_name t5-small \
+  --epochs 3 \
+  --batch_size 16
 ```
 
 Shell helper (env-style) to avoid long CLI strings:
