@@ -24,8 +24,8 @@ NORMALIZE="${NORMALIZE:-1}"
 USE_AMP="${USE_AMP:-1}"
 
 # Toggle whether to run base / fine-tuned models (run both by default)
-RUN_KALM_BASE="${RUN_KALM_BASE:-1}"
-RUN_KALM_LORA="${RUN_KALM_LORA:-0}"
+RUN_KALM_BASE="${RUN_KALM_BASE:-0}"
+RUN_KALM_LORA="${RUN_KALM_LORA:-1}"
 
 # Base model can point to the original KaLM embedding HF repo
 KALM_BASE_MODEL_DIR="${KALM_BASE_MODEL_DIR:-KaLM-Embedding/KaLM-embedding-multilingual-mini-instruct-v2.5}"

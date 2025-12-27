@@ -74,7 +74,10 @@ def build_agent_content_view(
         parts.append(np.array(A_tool_content, dtype=np.float32, copy=False))
 
     if not parts:
-        raise ValueError("Enable at least one of use_model_content_vector/use_tool_content_vector.")
+        #构建与A_model_content和A_tool_content横轴数轴相同形状的0矩阵
+        parts.append(np.zeros((A_model_content.shape[0], A_model_content.shape[1]), dtype=np.float32))
+        parts.append(np.zeros((A_tool_content.shape[0], A_tool_content.shape[1]), dtype=np.float32))
+         
 
     num_agents = parts[0].shape[0]
     for p in parts[1:]:
