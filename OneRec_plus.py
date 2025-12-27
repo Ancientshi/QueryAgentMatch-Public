@@ -781,6 +781,8 @@ def main():
                     help="candidate set size C (must be >= topk)")
     ap.add_argument("--cand_extra", type=int, default=32,
                     help="extra neighbors retrieved to allow dedup + GT insertion")
+    ap.add_argument("--eval_candidate_size", type=int, default=200,
+                    help="candidate set size for evaluation (sampled metrics)")
 
     ap.add_argument("--mode", choices=["gen","dpo"], default="gen")
     ap.add_argument("--dpo_steps", type=int, default=1000)
@@ -805,6 +807,7 @@ def main():
     ap.add_argument("--tok_init_fp16", type=int, default=1)
     
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--skip_eval", type=int, default=0, help="1 to skip validation (saves time)")
 
 
     args = ap.parse_args()
@@ -1104,62 +1107,63 @@ def main():
         print(f"[save] model -> {model_path}\n[save] meta  -> {meta_path}")
 
         # build full encodings (CPU)
-        enc_all = []
-        bs = 2048
-        sess_enc.eval()
-        with torch.no_grad():
-            for i in range(0, len(q_ids), bs):
-                qid_batch = q_ids[i:i+bs]
-                enc_vec = encode_sessions_in_chunks(qid_batch, chunk=getattr(args, "enc_chunk", 512))
-                enc_all.append(enc_vec.cpu())
-        enc_all = torch.cat(enc_all, dim=0)  # CPU
+        if not bool(args.skip_eval):
+            enc_all = []
+            bs = 2048
+            sess_enc.eval()
+            with torch.no_grad():
+                for i in range(0, len(q_ids), bs):
+                    qid_batch = q_ids[i:i+bs]
+                    enc_vec = encode_sessions_in_chunks(qid_batch, chunk=getattr(args, "enc_chunk", 512))
+                    enc_all.append(enc_vec.cpu())
+            enc_all = torch.cat(enc_all, dim=0)  # CPU
 
-        # --- eval qids: per-part cap ---
-        eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
-        eval_qids = sample_qids_by_part(
-            valid_qids,
-            qid_to_part=qid_to_part,
-            per_part=args.eval_per_part,
-            seed=args.seed,
-            parts=eval_parts
-        )
-        print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
+            # --- eval qids: per-part cap ---
+            eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
+            eval_qids = sample_qids_by_part(
+                valid_qids,
+                qid_to_part=qid_to_part,
+                per_part=args.eval_per_part,
+                seed=args.seed,
+                parts=eval_parts
+            )
+            print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
 
-        # overall
-        valid_metrics = evaluate_model_gen(
-            gen_model=gen,
-            enc_vecs_cpu=enc_all,
-            qid2idx=qid2idx,
-            a_ids=a_ids,
-            all_rankings=all_rankings,
-            eval_qids=eval_qids,
-            device=device,
-            ks=(5, 10, 50),
-            cand_size=1000,
-            rng_seed=args.seed,
-            qid_to_part=qid_to_part,
-        )
-        print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
-
-        # per-part
-        for part in eval_parts:
-            part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
-            if not part_qids:
-                continue
-            m_part = evaluate_model_gen(
+            # overall
+            valid_metrics = evaluate_model_gen(
                 gen_model=gen,
                 enc_vecs_cpu=enc_all,
                 qid2idx=qid2idx,
                 a_ids=a_ids,
                 all_rankings=all_rankings,
-                eval_qids=part_qids,
+                eval_qids=eval_qids,
                 device=device,
                 ks=(5, 10, 50),
-                cand_size=1000,
-                rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                cand_size=args.eval_candidate_size,
+                rng_seed=args.seed,
                 qid_to_part=qid_to_part,
             )
-            print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
+            print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
+
+            # per-part
+            for part in eval_parts:
+                part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
+                if not part_qids:
+                    continue
+                m_part = evaluate_model_gen(
+                    gen_model=gen,
+                    enc_vecs_cpu=enc_all,
+                    qid2idx=qid2idx,
+                    a_ids=a_ids,
+                    all_rankings=all_rankings,
+                    eval_qids=part_qids,
+                    device=device,
+                    ks=(5, 10, 50),
+                    cand_size=args.eval_candidate_size,
+                    rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                    qid_to_part=qid_to_part,
+                )
+                print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
 
 
     # ---------------------- Lite-DPO finetune ----------------------
