@@ -24,7 +24,7 @@ from agent_rec.config import (
 from agent_rec.data import stratified_train_valid_split
 from agent_rec.run_common import set_global_seed, warn_if_topk_diff
 
-import os, json, math, argparse, random, zlib
+import os, json, math, argparse, random, zlib, copy
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -569,9 +569,13 @@ def init_tok_emb_from_bge_plus_ids(
 # ---------------------- Reward Model & Lite-DPO ----------------------
 
 class RewardModel(nn.Module):
-    def __init__(self, enc_dim: int, tok_emb: nn.Embedding, hidden: int = 512):
+    def __init__(self, enc_dim: int, tok_emb: nn.Embedding, hidden: int = 512, freeze_tok: bool = True):
         super().__init__()
-        self.tok_emb = tok_emb
+        if freeze_tok:
+            # snapshot the embedding space used to pretrain RM to avoid drift during DPO finetune
+            self.tok_emb = nn.Embedding.from_pretrained(tok_emb.weight.detach().clone(), freeze=True)
+        else:
+            self.tok_emb = tok_emb
         self.ff = nn.Sequential(
             nn.Linear(enc_dim + tok_emb.embedding_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, hidden//2), nn.ReLU(),
@@ -591,22 +595,24 @@ class RewardModel(nn.Module):
         return self.ff(x).squeeze(1)
 
 class DPOTrainer:
-    def __init__(self, model: OneRecPlus, rm: RewardModel, beta: float = 0.1, pad_tok: int = 0):
+    def __init__(self, model: OneRecPlus, ref_model: OneRecPlus, rm: RewardModel, beta: float = 0.1, pad_tok: int = 0):
         self.model = model
+        self.ref_model = ref_model
         self.rm = rm
         self.beta = beta
         self.pad_tok = pad_tok
 
-    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor):
+    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model: Optional[OneRecPlus] = None):
         """
         seq: (B,L) full-vocab token ids (agents)
         cand_tok: (B,C)
         """
+        model = self.model if model is None else model
         B, L = seq.shape
         bos = torch.full((B, 1), 1, dtype=torch.long, device=seq.device)
         inp = torch.cat([bos, seq[:, :-1]], dim=1)  # teacher forcing input
 
-        logits_c = self.model(enc_vec, inp, cand_tok=cand_tok)      # (B,L,C)
+        logits_c = model(enc_vec, inp, cand_tok=cand_tok)      # (B,L,C)
         lp = F.log_softmax(logits_c, dim=-1)                        # (B,L,C)
 
         local = remap_targets_to_cand(seq, cand_tok, pad_tok=self.pad_tok, ignore_index=-100)  # (B,L)
@@ -618,16 +624,16 @@ class DPOTrainer:
         return lp_sum / token_counts
 
     def dpo_loss(self, enc_vec: torch.Tensor, pref_seq: torch.Tensor, nonpref_seq: torch.Tensor, cand_tok: torch.Tensor):
+        # policy log-prob
         lp_pref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok)
         lp_nonp = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok)
-
+        # frozen reference log-prob
         with torch.no_grad():
-            r_pref = self.rm(enc_vec, pref_seq)
-            r_nonp = self.rm(enc_vec, nonpref_seq)
-            adv = r_pref - r_nonp
+            lp_pref_ref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok, model=self.ref_model)
+            lp_nonp_ref = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok, model=self.ref_model)
 
-        logits = self.beta * adv + (lp_pref - lp_nonp)
-        return -F.logsigmoid(logits).mean()
+        logratio = (lp_pref - lp_pref_ref) - (lp_nonp - lp_nonp_ref)
+        return -F.logsigmoid(self.beta * logratio).mean()
 
 # ---------------------- Split / signature ----------------------
 
@@ -788,6 +794,7 @@ def main():
     ap.add_argument("--dpo_steps", type=int, default=1000)
     ap.add_argument("--dpo_batch", type=int, default=64)
     ap.add_argument("--beta", type=float, default=0.05)
+    ap.add_argument("--dpo_lr", type=float, default=None, help="Override LR for DPO; default = lr * 0.1")
 
     ap.add_argument("--nn_extra", type=int, default=8)
     ap.add_argument("--nn_batch", type=int, default=10000)
@@ -1173,8 +1180,14 @@ def main():
         sess_enc.load_state_dict(ckpt["sess_enc"])
         gen.load_state_dict(ckpt["gen"])
 
-        rm = RewardModel(enc_dim=512, tok_emb=gen.tok_emb, hidden=512).to(device)
-        dpo = DPOTrainer(model=gen, rm=rm, beta=args.beta, pad_tok=vocab.PAD)
+        # reference policy (frozen snapshot of CE model)
+        gen_ref = copy.deepcopy(gen).to(device)
+        gen_ref.eval()
+        for p in gen_ref.parameters():
+            p.requires_grad = False
+
+        rm = RewardModel(enc_dim=512, tok_emb=gen.tok_emb, hidden=512, freeze_tok=True).to(device)
+        dpo = DPOTrainer(model=gen, ref_model=gen_ref, rm=rm, beta=args.beta, pad_tok=vocab.PAD)
 
         scaler_rm = torch.cuda.amp.GradScaler(enabled=use_amp)
         scaler_dpo = torch.cuda.amp.GradScaler(enabled=use_amp)
@@ -1237,12 +1250,16 @@ def main():
             scaler_rm.update()
 
         print("[RM] done.")
+        rm.eval()
+        for p in rm.parameters():
+            p.requires_grad = False
 
         # Freeze session encoder for stability (optional)
         for p in sess_enc.parameters():
             p.requires_grad = False
 
-        opt_dpo = torch.optim.Adam([p for p in gen.parameters() if p.requires_grad], lr=args.lr)
+        lr_dpo = args.dpo_lr if args.dpo_lr is not None else args.lr * 0.1
+        opt_dpo = torch.optim.Adam([p for p in gen.parameters() if p.requires_grad], lr=lr_dpo)
 
         dpo_steps = args.dpo_steps
         dpo_batch = args.dpo_batch
@@ -1294,6 +1311,8 @@ def main():
                 loss = dpo.dpo_loss(enc_keep, pref_seq, nonpref_seq, cand_keep)
 
             scaler_dpo.scale(loss).backward()
+            scaler_dpo.unscale_(opt_dpo)
+            torch.nn.utils.clip_grad_norm_(gen.parameters(), 1.0)
             scaler_dpo.step(opt_dpo)
             scaler_dpo.update()
 
@@ -1343,8 +1362,9 @@ def main():
             eval_qids=eval_qids,
             device=device,
             ks=(5, 10, 50),
-            cand_size=1000,
+            cand_size=args.eval_candidate_size,
             rng_seed=args.seed,
+            qid_to_part=qid_to_part,
         )
         print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
 
@@ -1362,8 +1382,9 @@ def main():
                 eval_qids=part_qids,
                 device=device,
                 ks=(5, 10, 50),
-                cand_size=1000,
+                cand_size=args.eval_candidate_size,
                 rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                qid_to_part=qid_to_part,
             )
             print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
 
