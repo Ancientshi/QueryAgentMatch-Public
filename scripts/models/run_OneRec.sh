@@ -6,7 +6,7 @@ source "$SCRIPT_DIR/../common_env.sh"
 python "$SCRIPT_DIR/../../OneRec_plus.py" \
     --data_root "$DATA_ROOT" \
     --device "cuda:0" \
-    --batch_size 2048 \
+    --batch_size 4096 \
     --bge_feature_dir /home/yunxshi/Data/workspace/QueryAgentMatch/QueryAgentMatch-Public/dataset/.cache/shared/features/twotower_bge_fd6ccb32_01915b90 \
     --init_tok_from_bge 1 \
     --freeze_tok_emb 1 \
@@ -15,7 +15,7 @@ python "$SCRIPT_DIR/../../OneRec_plus.py" \
     --use_sessions 0 --session_len 0 \
     --train_mask 0 --candidate_size 200 \
     --eval_candidate_size 200 \
-    --skip_eval 1 \
+    --skip_eval 0 \
     --amp 1 \
 
 
