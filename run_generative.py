@@ -19,11 +19,12 @@ import json
 from pathlib import Path
 from typing import Iterable, List
 
-from agent_rec.generative import (
+from agent_rec.models.generative import (
     GenerationConfig,
     GenerativeStructuredRecommender,
     build_training_pairs_from_data_root,
 )
+from agent_rec.run_common import bootstrap_run
 
 
 def _write_jsonl(rows: Iterable[dict], path: Path) -> int:
@@ -60,7 +61,15 @@ def build_generator(args: argparse.Namespace) -> GenerativeStructuredRecommender
         max_tools=args.max_tools,
         tfidf_max_features=args.tfidf_max_features,
     )
-    return GenerativeStructuredRecommender.from_data_root(args.data_root, config=cfg)
+    boot = bootstrap_run(
+        data_root=args.data_root,
+        exp_name="generative",
+        topk=args.top_k,
+        with_tools=True,
+    )
+    return GenerativeStructuredRecommender.from_bundle(
+        boot.bundle, tools=boot.tools or {}, config=cfg, agent_order=boot.a_ids
+    )
 
 
 def maybe_export_pairs(args: argparse.Namespace) -> None:

@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
-from .data import collect_data, load_tools
-from .features import UNK_LLM_TOKEN, UNK_TOOL_TOKEN
-from .rerank_eval_utils import build_agent_text_cache
+from agent_rec.data import DatasetBundle, collect_data, load_tools
+from agent_rec.features import UNK_LLM_TOKEN, UNK_TOOL_TOKEN
+from agent_rec.rerank_eval_utils import build_agent_text_cache
 
 
 @dataclass
@@ -66,23 +66,29 @@ class GenerativeStructuredRecommender:
         self.config = config
 
     @classmethod
-    def from_data_root(
-        cls, data_root: str, *, config: GenerationConfig | None = None
+    def from_bundle(
+        cls,
+        bundle: DatasetBundle,
+        *,
+        tools: Mapping[str, dict],
+        config: GenerationConfig | None = None,
+        agent_order: Iterable[str] | None = None,
     ) -> "GenerativeStructuredRecommender":
-        """
-        Build a generator from the benchmark data directory.
+        """Build a generator from an in-memory dataset bundle.
 
-        This initializes TF-IDF weights over agent descriptions and tracks the
-        LLM/tool metadata needed to build the structured outputs.
+        ``bundle`` should come from the shared data loader utilities (e.g.
+        :func:`agent_rec.run_common.bootstrap_run`). This keeps the generator
+        aligned with the rest of the ``run_*.py`` entrypoints so they share
+        logging, seeding, and data splits.
         """
 
         cfg = config or GenerationConfig()
-        bundle = collect_data(data_root)
-        tools = load_tools(data_root)
         agent_text_cache = build_agent_text_cache(bundle.all_agents, tools)
 
         agent_infos: List[AgentGenerationInfo] = []
-        for aid, agent in bundle.all_agents.items():
+        agent_ids = list(agent_order) if agent_order is not None else sorted(bundle.all_agents.keys())
+        for aid in agent_ids:
+            agent = bundle.all_agents.get(aid, {})
             m = (agent.get("M") or {}) if isinstance(agent, dict) else {}
             t = (agent.get("T") or {}) if isinstance(agent, dict) else {}
 
@@ -112,6 +118,21 @@ class GenerativeStructuredRecommender:
             agents=agent_infos,
             config=cfg,
         )
+
+    @classmethod
+    def from_data_root(
+        cls, data_root: str, *, config: GenerationConfig | None = None, parts: Iterable[str] | None = None
+    ) -> "GenerativeStructuredRecommender":
+        """
+        Build a generator from the benchmark data directory.
+
+        This initializes TF-IDF weights over agent descriptions and tracks the
+        LLM/tool metadata needed to build the structured outputs.
+        """
+
+        bundle = collect_data(data_root, parts=list(parts) if parts is not None else None)
+        tools = load_tools(data_root)
+        return cls.from_bundle(bundle, tools=tools, config=config)
 
     def _score_query(self, query: str) -> Tuple[np.ndarray, np.ndarray]:
         q_vec = self.vectorizer.transform([query])
@@ -196,7 +217,11 @@ class GenerativeStructuredRecommender:
 
 
 def build_training_pairs_from_data_root(
-    data_root: str, *, config: GenerationConfig | None = None, max_examples: int | None = None
+    data_root: str,
+    *,
+    config: GenerationConfig | None = None,
+    max_examples: int | None = None,
+    parts: Iterable[str] | None = None,
 ) -> List[Dict[str, str]]:
     """
     Helper wrapper to build supervised pairs directly from the data root.
@@ -206,8 +231,9 @@ def build_training_pairs_from_data_root(
     ``LLM_TOKEN <TOOL_SEP> TOOL_TOKEN ... <SPECIAL_END>`` template.
     """
 
-    bundle = collect_data(data_root)
-    gen = GenerativeStructuredRecommender.from_data_root(data_root, config=config)
+    bundle = collect_data(data_root, parts=list(parts) if parts is not None else None)
+    tools = load_tools(data_root)
+    gen = GenerativeStructuredRecommender.from_bundle(bundle, tools=tools, config=config)
     return gen.build_supervised_pairs(
         rankings=bundle.all_rankings,
         questions=bundle.all_questions,
