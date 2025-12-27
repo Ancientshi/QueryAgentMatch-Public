@@ -602,16 +602,17 @@ class DPOTrainer:
         self.beta = beta
         self.pad_tok = pad_tok
 
-    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor):
+    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model: Optional[OneRecPlus] = None):
         """
         seq: (B,L) full-vocab token ids (agents)
         cand_tok: (B,C)
         """
+        model = self.model if model is None else model
         B, L = seq.shape
         bos = torch.full((B, 1), 1, dtype=torch.long, device=seq.device)
         inp = torch.cat([bos, seq[:, :-1]], dim=1)  # teacher forcing input
 
-        logits_c = self.model(enc_vec, inp, cand_tok=cand_tok)      # (B,L,C)
+        logits_c = model(enc_vec, inp, cand_tok=cand_tok)      # (B,L,C)
         lp = F.log_softmax(logits_c, dim=-1)                        # (B,L,C)
 
         local = remap_targets_to_cand(seq, cand_tok, pad_tok=self.pad_tok, ignore_index=-100)  # (B,L)
@@ -628,8 +629,8 @@ class DPOTrainer:
         lp_nonp = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok)
         # frozen reference log-prob
         with torch.no_grad():
-            lp_pref_ref = self.seq_logprob_candidate_only(self.ref_model, enc_vec, pref_seq, cand_tok)
-            lp_nonp_ref = self.seq_logprob_candidate_only(self.ref_model, enc_vec, nonpref_seq, cand_tok)
+            lp_pref_ref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok, model=self.ref_model)
+            lp_nonp_ref = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok, model=self.ref_model)
 
         logratio = (lp_pref - lp_pref_ref) - (lp_nonp - lp_nonp_ref)
         return -F.logsigmoid(self.beta * logratio).mean()
