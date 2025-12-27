@@ -16,6 +16,13 @@ Optional:
 """
 
 from agent_rec.features import load_feature_cache, build_agent_content_view
+from agent_rec.config import (
+    EVAL_TOPK,
+    TFIDF_MAX_FEATURES,
+    pos_topk_for_qid,
+)
+from agent_rec.data import stratified_train_valid_split
+from agent_rec.run_common import set_global_seed, warn_if_topk_diff
 
 import os, json, math, argparse, random, zlib
 from datetime import datetime
@@ -34,7 +41,6 @@ from sklearn.neighbors import NearestNeighbors
 from utils import print_metrics_table
 
 filename = os.path.splitext(os.path.basename(__file__))[0]
-POS_TOPK = 5
 
 
 
@@ -46,21 +52,8 @@ def stratified_split_by_part(
     valid_ratio: float,
     seed: int
 ) -> Tuple[List[str], List[str]]:
-    rng = random.Random(seed)
-    buckets = defaultdict(list)
-    for q in qids:
-        buckets[qid_to_part.get(q, "Unknown")].append(q)
-
-    train, valid = [], []
-    for part, lst in buckets.items():
-        rng.shuffle(lst)
-        n_valid = int(len(lst) * valid_ratio)
-        valid.extend(lst[:n_valid])
-        train.extend(lst[n_valid:])
-
-    rng.shuffle(train)
-    rng.shuffle(valid)
-    return train, valid
+    # Delegate to shared splitter to align with other pipelines (ensures per-part minimums).
+    return stratified_train_valid_split(qids, qid_to_part=qid_to_part, valid_ratio=valid_ratio, seed=seed)
 
 
 def sample_qids_by_part(
@@ -144,16 +137,16 @@ def collect_data(data_root: str):
 # ---------------------- Text & TF-IDF ----------------------
 
 def build_text_corpora(all_agents, all_questions, tools):
-    q_ids = list(all_questions.keys())
+    q_ids = sorted(all_questions.keys())
     q_texts = [all_questions[qid].get("input", "") for qid in q_ids]
 
-    tool_names = list(tools.keys())
+    tool_names = sorted(tools.keys())
     def _tool_text(tn: str) -> str:
         t = tools.get(tn, {})
         desc = t.get("description", "")
         return f"{tn} {desc}".strip()
 
-    a_ids = list(all_agents.keys())
+    a_ids = sorted(all_agents.keys())
     a_texts = []
     a_tool_lists = []
     for aid in a_ids:
@@ -665,7 +658,8 @@ def evaluate_model_gen(
     cand_size: int = 1000,
     rng_seed: int = 123,
     ref_k: Optional[int] = None,
-    bar_update_every: int = 1
+    bar_update_every: int = 1,
+    qid_to_part: Optional[Dict[str, str]] = None
 ):
     if ref_k is None:
         ref_k = max(ks)
@@ -680,7 +674,8 @@ def evaluate_model_gen(
 
     pbar = tqdm(eval_qids, desc="Evaluating (gen, sampled)", total=len(eval_qids))
     for i, qid in enumerate(pbar, start=1):
-        gt_list = [aid for aid in all_rankings.get(qid, [])[:POS_TOPK] if aid in all_agent_set]
+        k_pos = pos_topk_for_qid(qid, qid_to_part)
+        gt_list = [aid for aid in all_rankings.get(qid, [])[:k_pos] if aid in all_agent_set]
         if not gt_list:
             skipped += 1
             if (i % bar_update_every) == 0:
@@ -768,7 +763,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, required=True)
     ap.add_argument("--device", type=str, default="cpu")
-    ap.add_argument("--max_features", type=int, default=5000)
+    ap.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
 
     ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch_size", type=int, default=256)
@@ -786,6 +781,8 @@ def main():
                     help="candidate set size C (must be >= topk)")
     ap.add_argument("--cand_extra", type=int, default=32,
                     help="extra neighbors retrieved to allow dedup + GT insertion")
+    ap.add_argument("--eval_candidate_size", type=int, default=200,
+                    help="candidate set size for evaluation (sampled metrics)")
 
     ap.add_argument("--mode", choices=["gen","dpo"], default="gen")
     ap.add_argument("--dpo_steps", type=int, default=1000)
@@ -810,12 +807,14 @@ def main():
     ap.add_argument("--tok_init_fp16", type=int, default=1)
     
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--skip_eval", type=int, default=0, help="1 to skip validation (saves time)")
 
 
     args = ap.parse_args()
     eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
 
-    random.seed(1234); np.random.seed(1234); torch.manual_seed(1234)
+    warn_if_topk_diff(args.topk, expected=EVAL_TOPK)
+    set_global_seed(args.seed)
     device = torch.device(args.device)
     use_cuda = (device.type == "cuda")
     use_amp = bool(args.amp) and use_cuda
@@ -1017,7 +1016,8 @@ def main():
     def build_targets(qids: List[str]) -> Tuple[List[str], List[List[int]]]:
         in_q = []; tgt_tok = []
         for qid in qids:
-            ranked = [aid for aid in all_rankings.get(qid, [])[:args.topk] if aid in vocab.aid2tok]
+            k_pos = min(args.topk, pos_topk_for_qid(qid, qid_to_part))
+            ranked = [aid for aid in all_rankings.get(qid, [])[:k_pos] if aid in vocab.aid2tok]
             if not ranked:
                 continue
             toks = [vocab.aid_to_token(a) for a in ranked]
@@ -1107,60 +1107,63 @@ def main():
         print(f"[save] model -> {model_path}\n[save] meta  -> {meta_path}")
 
         # build full encodings (CPU)
-        enc_all = []
-        bs = 2048
-        sess_enc.eval()
-        with torch.no_grad():
-            for i in range(0, len(q_ids), bs):
-                qid_batch = q_ids[i:i+bs]
-                enc_vec = encode_sessions_in_chunks(qid_batch, chunk=getattr(args, "enc_chunk", 512))
-                enc_all.append(enc_vec.cpu())
-        enc_all = torch.cat(enc_all, dim=0)  # CPU
+        if not bool(args.skip_eval):
+            enc_all = []
+            bs = 2048
+            sess_enc.eval()
+            with torch.no_grad():
+                for i in range(0, len(q_ids), bs):
+                    qid_batch = q_ids[i:i+bs]
+                    enc_vec = encode_sessions_in_chunks(qid_batch, chunk=getattr(args, "enc_chunk", 512))
+                    enc_all.append(enc_vec.cpu())
+            enc_all = torch.cat(enc_all, dim=0)  # CPU
 
-        # --- eval qids: per-part cap ---
-        eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
-        eval_qids = sample_qids_by_part(
-            valid_qids,
-            qid_to_part=qid_to_part,
-            per_part=args.eval_per_part,
-            seed=args.seed,
-            parts=eval_parts
-        )
-        print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
+            # --- eval qids: per-part cap ---
+            eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
+            eval_qids = sample_qids_by_part(
+                valid_qids,
+                qid_to_part=qid_to_part,
+                per_part=args.eval_per_part,
+                seed=args.seed,
+                parts=eval_parts
+            )
+            print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
 
-        # overall
-        valid_metrics = evaluate_model_gen(
-            gen_model=gen,
-            enc_vecs_cpu=enc_all,
-            qid2idx=qid2idx,
-            a_ids=a_ids,
-            all_rankings=all_rankings,
-            eval_qids=eval_qids,
-            device=device,
-            ks=(5, 10, 50),
-            cand_size=1000,
-            rng_seed=args.seed,
-        )
-        print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
-
-        # per-part
-        for part in eval_parts:
-            part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
-            if not part_qids:
-                continue
-            m_part = evaluate_model_gen(
+            # overall
+            valid_metrics = evaluate_model_gen(
                 gen_model=gen,
                 enc_vecs_cpu=enc_all,
                 qid2idx=qid2idx,
                 a_ids=a_ids,
                 all_rankings=all_rankings,
-                eval_qids=part_qids,
+                eval_qids=eval_qids,
                 device=device,
                 ks=(5, 10, 50),
-                cand_size=1000,
-                rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                cand_size=args.eval_candidate_size,
+                rng_seed=args.seed,
+                qid_to_part=qid_to_part,
             )
-            print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
+            print_metrics_table("Validation (GEN, per-part sampled)", valid_metrics, filename=filename)
+
+            # per-part
+            for part in eval_parts:
+                part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
+                if not part_qids:
+                    continue
+                m_part = evaluate_model_gen(
+                    gen_model=gen,
+                    enc_vecs_cpu=enc_all,
+                    qid2idx=qid2idx,
+                    a_ids=a_ids,
+                    all_rankings=all_rankings,
+                    eval_qids=part_qids,
+                    device=device,
+                    ks=(5, 10, 50),
+                    cand_size=args.eval_candidate_size,
+                    rng_seed=args.seed + 17,  # 给个小偏移，避免和 overall 完全一样的 neg sampling（可选）
+                    qid_to_part=qid_to_part,
+                )
+                print_metrics_table(f"Validation (GEN) {part} (n={len(part_qids)})", m_part, filename=filename)
 
 
     # ---------------------- Lite-DPO finetune ----------------------
