@@ -19,11 +19,12 @@ import json
 from pathlib import Path
 from typing import Iterable, List
 
-from agent_rec.generative import (
+from agent_rec.models.generative import (
     GenerationConfig,
     GenerativeStructuredRecommender,
     build_training_pairs_from_data_root,
 )
+from agent_rec.run_common import bootstrap_run
 
 
 def _write_jsonl(rows: Iterable[dict], path: Path) -> int:
@@ -37,9 +38,20 @@ def _write_jsonl(rows: Iterable[dict], path: Path) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=(
+            "Inference-only helper for the lightweight generative recommender. "
+            "Use --query to run retrieval-format generation, or --export_pairs to dump "
+            "supervised targets for finetuning an external seq2seq model."
+        )
+    )
     ap.add_argument("--data_root", type=str, required=True)
-    ap.add_argument("--query", type=str, default="", help="Single query to generate tokens for")
+    ap.add_argument(
+        "--query",
+        type=str,
+        default="",
+        help="Single query to generate tokens for (inference mode). Leave empty to skip inference.",
+    )
     ap.add_argument("--top_k", type=int, default=10, help="Number of agents to return")
     ap.add_argument("--with_metadata", type=int, default=1, help="1 to include scores/ids in output")
 
@@ -48,7 +60,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max_tools", type=int, default=8)
     ap.add_argument("--tfidf_max_features", type=int, default=5000)
 
-    ap.add_argument("--export_pairs", type=str, default="", help="Optional path to write supervised pairs (JSONL)")
+    ap.add_argument(
+        "--export_pairs",
+        type=str,
+        default="",
+        help="Optional path to write supervised pairs (JSONL) for downstream seq2seq training. "
+        "If set, the script does not train any model—it only exports data.",
+    )
     ap.add_argument("--max_examples", type=int, default=0, help="Limit number of supervised pairs (0 = all)")
     return ap.parse_args()
 
@@ -60,7 +78,15 @@ def build_generator(args: argparse.Namespace) -> GenerativeStructuredRecommender
         max_tools=args.max_tools,
         tfidf_max_features=args.tfidf_max_features,
     )
-    return GenerativeStructuredRecommender.from_data_root(args.data_root, config=cfg)
+    boot = bootstrap_run(
+        data_root=args.data_root,
+        exp_name="generative",
+        topk=args.top_k,
+        with_tools=True,
+    )
+    return GenerativeStructuredRecommender.from_bundle(
+        boot.bundle, tools=boot.tools or {}, config=cfg, agent_order=boot.a_ids
+    )
 
 
 def maybe_export_pairs(args: argparse.Namespace) -> None:
@@ -85,16 +111,20 @@ def maybe_export_pairs(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
 
-    maybe_export_pairs(args)
+    if not args.query and not args.export_pairs:
+        raise SystemExit("Nothing to do: provide --query for inference and/or --export_pairs for data export.")
 
-    if not args.query:
-        return
+    if args.export_pairs:
+        print("[mode] exporting supervised pairs (no training performed).")
+        maybe_export_pairs(args)
 
-    gen = build_generator(args)
-    results: List[str | dict] = gen.generate(
-        args.query, top_k=args.top_k, with_metadata=bool(args.with_metadata)
-    )
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    if args.query:
+        print("[mode] running inference for a single query.")
+        gen = build_generator(args)
+        results: List[str | dict] = gen.generate(
+            args.query, top_k=args.top_k, with_metadata=bool(args.with_metadata)
+        )
+        print(json.dumps(results, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
