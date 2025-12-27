@@ -40,12 +40,12 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", type=str, required=True)
     ap.add_argument("--query", type=str, default="", help="Single query to generate tokens for")
-    ap.add_argument("--top_k", type=int, default=1, help="Number of agents to return")
-    ap.add_argument("--with_metadata", type=int, default=0, help="1 to include scores/ids in output")
+    ap.add_argument("--top_k", type=int, default=10, help="Number of agents to return")
+    ap.add_argument("--with_metadata", type=int, default=1, help="1 to include scores/ids in output")
 
     ap.add_argument("--tool_sep_token", type=str, default="<TOOL_SEP>")
     ap.add_argument("--end_token", type=str, default="<SPECIAL_END>")
-    ap.add_argument("--max_tools", type=int, default=4)
+    ap.add_argument("--max_tools", type=int, default=8)
     ap.add_argument("--tfidf_max_features", type=int, default=5000)
 
     ap.add_argument("--export_pairs", type=str, default="", help="Optional path to write supervised pairs (JSONL)")

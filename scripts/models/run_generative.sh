@@ -22,10 +22,8 @@ set -euo pipefail
 #   DATA_ROOT=/data/benchmark QUERY="如何写个爬虫？" TOP_K=3 WITH_METADATA=1 ./scripts/run_generative.sh
 #   DATA_ROOT=/data/benchmark EXPORT_PAIRS=/tmp/pairs.jsonl MAX_EXAMPLES=8000 ./scripts/run_generative.sh
 
-if [[ -z "${DATA_ROOT:-}" ]]; then
-  echo "[error] DATA_ROOT is required." >&2
-  exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../common_env.sh"
 
 QUERY=${QUERY:-}
 TOP_K=${TOP_K:-1}
@@ -37,7 +35,7 @@ END_TOKEN=${END_TOKEN:-"<SPECIAL_END>"}
 MAX_TOOLS=${MAX_TOOLS:-4}
 TFIDF_MAX_FEATURES=${TFIDF_MAX_FEATURES:-5000}
 
-python run_generative.py \
+python "$SCRIPT_DIR/../../run_generative.py" \
   --data_root "${DATA_ROOT}" \
   --query "${QUERY}" \
   --top_k "${TOP_K}" \
