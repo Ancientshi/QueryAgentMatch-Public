@@ -18,7 +18,7 @@ python "$SCRIPT_DIR/../../OneRec_plus.py" \
   --hidden 512 --num_layers 2 --n_heads 8 \
   --dropout 0.1 --max_len 64 \
   \
-  --dpo_steps 1200 \
+  --dpo_steps 500 \
   --dpo_batch 64 \
   --beta 0.05 \
   --lr 1e-5 \
@@ -37,4 +37,5 @@ python "$SCRIPT_DIR/../../OneRec_plus.py" \
   --enc_chunk 512 \
   --eval_candidate_size 200 \
   --skip_eval 0 \
-  --amp 1
+  --amp 1 \
+  --dpo_use_gt_reward 1

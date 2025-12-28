@@ -7,9 +7,9 @@ source "$SCRIPT_DIR/../common_env.sh"
 EPOCHS=2
 BATCH_SIZE=128
 LR=1e-3
-DEVICE="cuda:1"
+DEVICE="cuda:0"
 
-TUNE_MODE="${TUNE_MODE:-lora}"
+TUNE_MODE="${TUNE_MODE:-frozen}"
 UNFREEZE_LAST_N="${UNFREEZE_LAST_N:-2}"
 UNFREEZE_EMB="${UNFREEZE_EMB:-1}"
 GRAD_CKPT="${GRAD_CKPT:-0}"
@@ -50,8 +50,8 @@ python "$SCRIPT_DIR/../../run_bpr_bert.py" \
   --encoder_lr "$ENCODER_LR" \
   --encoder_weight_decay "$ENCODER_WEIGHT_DECAY" \
   --use_query_id_emb 0 \
-  --use_llm_id_emb 1 \
-  --use_tool_id_emb 1 \
+  --use_llm_id_emb 0 \
+  --use_tool_id_emb 0 \
   --use_model_content_vector 1 \
   --use_tool_content_vector 1 \
-  --exp_name "bpr_bert_${TUNE_MODE}"
+  --exp_name "bpr_bert_${TUNE_MODE}_content"

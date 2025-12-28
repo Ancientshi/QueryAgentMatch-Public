@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OneRec++ (Query->Agent, improved):
+OneRec++ (Query->Agent, one-step generative ranking)
+
+New task definition:
   ✅ No sessions (true query->agent)
-  ✅ Never build full (B,L,V) logits — candidate-only logits (B,L,C)
-  ✅ CPU TF-IDF retrieval for candidate set
-  ✅ Mixed negatives: hard (TF-IDF) + random
-  ✅ Stronger encoder: QueryEncoder (MLP)
-  ✅ Stronger decoder option: Transformer decoder (default) or GRU
+  ✅ Candidate-only scoring: logits (B,C) over candidate agents
+  ✅ Training = multi-positive one-step softmax (orderless positives)
+      - PartI: top-10 are positives
+      - PartII: top-1 is positive
+      - PartIII: top-5 are positives
+  ✅ Inference = one-step, return prob top-10 (no autoregressive decoding)
+  ✅ CPU TF-IDF retrieval for candidate set + mixed negatives (hard + random)
   ✅ Auxiliary multi-positive InfoNCE (in-batch negatives) for stronger retrieval space
-  ✅ Optional: RM + Lite-DPO finetune (candidate-only logprob)
-  ✅ DPO balanced sampling across parts (prevents PartII dominance)
-  ✅ "One-labor" option: GT-based reward (overlap + nDCG) for DPO preference (default)
+  ✅ Optional: init agent token embeddings from BGE content + (llm_id, tool_id) IDs
+  ✅ DPO: balanced sampling across parts + GT-based reward (overlap + nDCG@K) by default
+     - DPO uses the same one-step distribution and "sampling without replacement" lists
+
+NEW (your request):
+  ✅ DPO can run in 3 "part-specific" modes (controlled by --dpo_part_scope):
+      1) finetune on PartI and eval only on PartI
+      2) finetune on PartII and eval only on PartII
+      3) finetune on PartIII and eval only on PartIII
+  ✅ Saved ckpt filename will include suffix _PartI/_PartII/_PartIII accordingly.
 
 Dataset:
   {data_root}/PartI|PartII|PartIII/{agents,questions,rankings}/merge.json
@@ -46,6 +57,7 @@ from sklearn.preprocessing import normalize
 from sklearn.neighbors import NearestNeighbors
 
 from utils import print_metrics_table
+
 
 filename = os.path.splitext(os.path.basename(__file__))[0]
 
@@ -174,7 +186,6 @@ def _dcg_at_k(binary_hits, k):
 
 @torch.no_grad()
 def evaluate_sampled(pred_ids_topk: List[str], rel_set: set, ks=(10,)):
-    # NOTE: ks must be a tuple, e.g. (10,) not (10)
     bin_hits = [1 if aid in rel_set else 0 for aid in pred_ids_topk]
     out = {}
     for k in ks:
@@ -200,7 +211,9 @@ def evaluate_sampled(pred_ids_topk: List[str], rel_set: set, ks=(10,)):
 
 class AgentVocab:
     def __init__(self, a_ids: List[str]):
-        self.PAD = 0; self.BOS = 1; self.offset = 2
+        self.PAD = 0
+        self.BOS = 1
+        self.offset = 2
         self.a_ids = a_ids
         self.vocab_size = len(a_ids) + self.offset
         self.aid2tok = {aid: i + self.offset for i, aid in enumerate(a_ids)}
@@ -213,23 +226,6 @@ class AgentVocab:
         if tok < self.offset:
             return None
         return self.tok2aid.get(tok, None)
-
-
-# ---------------------- candidate remap ----------------------
-
-def remap_targets_to_cand(
-    tgt_tok: torch.Tensor,      # (B,L) full-vocab token ids
-    cand_tok: torch.Tensor,     # (B,C) candidate token ids
-    pad_tok: int = 0,
-    ignore_index: int = -100
-) -> torch.Tensor:
-    # (B,L,C)
-    match = (tgt_tok.unsqueeze(-1) == cand_tok.unsqueeze(1))
-    has = match.any(dim=-1)  # (B,L)
-    local = match.float().argmax(dim=-1)  # (B,L), arbitrary if no match
-    local = torch.where(has, local, torch.full_like(local, ignore_index))
-    local = torch.where(tgt_tok == pad_tok, torch.full_like(local, ignore_index), local)
-    return local
 
 
 # ---------------------- QueryEncoder ----------------------
@@ -254,199 +250,126 @@ class QueryEncoder(nn.Module):
         return self.net(q_vec)
 
 
-# ---------------------- Generator (GRU) ----------------------
+# ---------------------- One-step Generator ----------------------
 
-class OneRecPlusGRU(nn.Module):
+class OneStepGenerator(nn.Module):
     """
-    Generator with tied token embeddings. Supports candidate-only logits (B,L,C).
-    Also includes a_proj for InfoNCE: tok_dim -> enc_dim.
+    One-step generative scoring over candidate agents.
+
+    - Token embedding table: tok_emb (vocab_size, tok_dim) with PAD/BOS fixed to zeros.
+    - Score(query, agent) = dot( q_proj(enc_vec), tok_emb(agent_token) )
+    - Candidate-only logits: (B,C)
+
+    Also includes a_proj (tok_dim -> enc_dim) for InfoNCE.
     """
-    def __init__(self, enc_dim: int, vocab_size: int, hidden: int = 512, num_layers: int = 2, tok_dim: int = 256):
+    def __init__(self, enc_dim: int, vocab_size: int, tok_dim: int = 256, hidden: int = 512, dropout: float = 0.1):
         super().__init__()
-        self.hidden = hidden
-        self.num_layers = num_layers
+        self.enc_dim = enc_dim
         self.vocab_size = vocab_size
         self.tok_dim = tok_dim
-        self.enc_dim = enc_dim
 
         self.tok_emb = nn.Embedding(vocab_size, tok_dim)
-        self.enc_to_h = nn.Linear(enc_dim, hidden)
-        self.dec = nn.GRU(input_size=tok_dim, hidden_size=hidden, num_layers=num_layers, batch_first=True)
-        self.bridge = nn.Linear(hidden, tok_dim, bias=False)
+        self.q_proj = nn.Sequential(
+            nn.Linear(enc_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, tok_dim, bias=False),
+        )
 
-        # for InfoNCE
+        # for InfoNCE: tok_dim -> enc_dim
         self.a_proj = nn.Linear(tok_dim, enc_dim, bias=False)
 
         nn.init.xavier_uniform_(self.tok_emb.weight)
-        nn.init.xavier_uniform_(self.enc_to_h.weight); nn.init.zeros_(self.enc_to_h.bias)
-        nn.init.xavier_uniform_(self.bridge.weight)
+        for m in self.q_proj:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
         nn.init.xavier_uniform_(self.a_proj.weight)
 
         with torch.no_grad():
             self.tok_emb.weight.data[0].zero_()  # PAD
             self.tok_emb.weight.data[1].zero_()  # BOS
 
-    def forward(self, enc_vec: torch.Tensor, tgt_inp_tok: torch.Tensor, cand_tok: torch.Tensor):
-        B, L = tgt_inp_tok.shape
-        h0 = self.enc_to_h(enc_vec).unsqueeze(0).repeat(self.num_layers, 1, 1)
-        x = self.tok_emb(tgt_inp_tok)   # (B,L,E)
-        out, _ = self.dec(x, h0)        # (B,L,H)
-        z = self.bridge(out)            # (B,L,E)
-        Wc = self.tok_emb(cand_tok)     # (B,C,E)
-        logits_c = torch.einsum("ble,bce->blc", z, Wc)
-        return logits_c
+    def score(self, enc_vec: torch.Tensor, cand_tok: torch.Tensor) -> torch.Tensor:
+        """
+        enc_vec: (B, enc_dim)
+        cand_tok: (B, C) full vocab tokens
+        returns logits: (B, C)
+        """
+        q = self.q_proj(enc_vec)             # (B, tok_dim)
+        Wc = self.tok_emb(cand_tok)          # (B, C, tok_dim)
+        logits = torch.einsum("be,bce->bc", q, Wc)
+        return logits
 
     @torch.no_grad()
     def generate(self, enc_vec: torch.Tensor, topk: int, cand_tok: torch.Tensor, temperature: float = 0.0):
+        """
+        One-step inference:
+          - temperature=0: take topk by logits
+          - temperature>0: sample topk without replacement from softmax(logits/temperature)
+        Returns: (B, topk) tokens (PAD padded if topk > C)
+        """
         was_training = self.training
         self.eval()
         try:
-            B = enc_vec.size(0)
-            h = self.enc_to_h(enc_vec).unsqueeze(0).repeat(self.num_layers, 1, 1)
-            prev = torch.full((B, 1), 1, dtype=torch.long, device=enc_vec.device)  # BOS
+            B, C = cand_tok.shape
+            K = min(topk, C)
 
-            C = cand_tok.size(1)
-            used_c = torch.zeros((B, C), dtype=torch.bool, device=enc_vec.device)
-            used_c |= (cand_tok < 2)
+            logits = self.score(enc_vec, cand_tok)                   # (B,C)
+            invalid = (cand_tok < 2)
 
-            Wc = self.tok_emb(cand_tok)  # (B,C,E)
+            if temperature and temperature > 0:
+                logits2 = logits.masked_fill(invalid, -1e9)
+                probs = F.softmax(logits2 / temperature, dim=-1)
+                row_sum = probs.sum(dim=1, keepdim=True)
+                probs = torch.where(row_sum > 0, probs / row_sum, torch.full_like(probs, 1.0 / C))
+                idx = torch.multinomial(probs, num_samples=K, replacement=False)  # (B,K)
+            else:
+                logits2 = logits.masked_fill(invalid, float("-inf"))
+                idx = torch.topk(logits2, k=K, dim=-1).indices                    # (B,K)
 
-            out_tokens = []
-            for _ in range(topk):
-                x = self.tok_emb(prev)
-                o, h = self.dec(x, h)
-                z = self.bridge(o[:, -1])                  # (B,E)
-                logits = torch.einsum("be,bce->bc", z, Wc) # (B,C)
-                logits = logits.masked_fill(used_c, float("-inf"))
+            out = cand_tok.gather(1, idx)                                         # (B,K)
 
-                if temperature and temperature > 0:
-                    probs = F.softmax(logits / temperature, dim=-1)
-                    next_pos = torch.multinomial(probs, 1).squeeze(1)
-                else:
-                    next_pos = torch.argmax(logits, dim=-1)
+            if K < topk:
+                pad = torch.full((B, topk - K), 0, dtype=torch.long, device=out.device)
+                out = torch.cat([out, pad], dim=1)
 
-                next_tok = cand_tok.gather(1, next_pos.unsqueeze(1)).squeeze(1)
-                out_tokens.append(next_tok)
-                prev = next_tok.unsqueeze(1)
-                used_c.scatter_(1, next_pos.unsqueeze(1), True)
-
-            return torch.stack(out_tokens, dim=1)
+            return out
         finally:
             self.train(was_training)
 
 
-# ---------------------- Generator (Transformer) ----------------------
+# ---------------------- One-step multi-positive loss ----------------------
 
-class OneRecPlusTransformer(nn.Module):
+def multi_pos_softmax_loss(
+    logits: torch.Tensor,        # (B, C) one-step logits over candidates
+    cand_tok: torch.Tensor,      # (B, C)
+    gt_tok: torch.Tensor,        # (B, K) padded positives (orderless)
+    pad_tok: int = 0,
+    offset: int = 2,
+) -> torch.Tensor:
     """
-    Transformer decoder-style (implemented via causal TransformerEncoder) with tied token embeddings.
-    Candidate-only logits (B,L,C). Includes a_proj for InfoNCE.
+    Multi-positive softmax (orderless):
+      L = -log ( sum_{pos in P} exp(s_pos) / sum_{c in C} exp(s_c) )
     """
-    def __init__(
-        self,
-        enc_dim: int,
-        vocab_size: int,
-        hidden: int = 512,
-        n_heads: int = 8,
-        n_layers: int = 2,
-        tok_dim: int = 256,
-        max_len: int = 64,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.enc_dim = enc_dim
-        self.tok_dim = tok_dim
-        self.hidden = hidden
-        self.max_len = max_len
+    gt_mask = (gt_tok != pad_tok) & (gt_tok >= offset)             # (B,K)
+    match = (cand_tok.unsqueeze(1) == gt_tok.unsqueeze(2)) & gt_mask.unsqueeze(2)  # (B,K,C)
+    pos_any = match.any(dim=1)                                      # (B,C)
 
-        self.tok_emb = nn.Embedding(vocab_size, tok_dim)
-        self.pos_emb = nn.Embedding(max_len, tok_dim)
+    invalid = (cand_tok < offset)
+    logits = logits.masked_fill(invalid, float("-inf"))
 
-        self.cond = nn.Linear(enc_dim, tok_dim, bias=False)
-        self.in_proj = nn.Linear(tok_dim, hidden)
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=hidden,
-            nhead=n_heads,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
-        )
-        self.dec = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        self.bridge = nn.Linear(hidden, tok_dim, bias=False)
+    log_denom = torch.logsumexp(logits, dim=1)                      # (B,)
 
-        # for InfoNCE
-        self.a_proj = nn.Linear(tok_dim, enc_dim, bias=False)
+    logits_pos = logits.masked_fill(~pos_any, float("-inf"))
+    log_num = torch.logsumexp(logits_pos, dim=1)                    # (B,)
 
-        nn.init.xavier_uniform_(self.tok_emb.weight)
-        nn.init.xavier_uniform_(self.pos_emb.weight)
-        nn.init.xavier_uniform_(self.cond.weight)
-        nn.init.xavier_uniform_(self.in_proj.weight); nn.init.zeros_(self.in_proj.bias)
-        nn.init.xavier_uniform_(self.bridge.weight)
-        nn.init.xavier_uniform_(self.a_proj.weight)
-
-        with torch.no_grad():
-            self.tok_emb.weight.data[0].zero_()
-            self.tok_emb.weight.data[1].zero_()
-
-    def _causal_mask(self, L: int, device):
-        m = torch.full((L, L), float("-inf"), device=device)
-        m = torch.triu(m, diagonal=1)
-        return m
-
-    def forward(self, enc_vec: torch.Tensor, tgt_inp_tok: torch.Tensor, cand_tok: torch.Tensor):
-        B, L = tgt_inp_tok.shape
-        if L > self.max_len:
-            raise ValueError(f"Sequence length L={L} exceeds max_len={self.max_len}. Increase --max_len.")
-
-        pos = torch.arange(L, device=tgt_inp_tok.device).unsqueeze(0)  # (1,L)
-        x = self.tok_emb(tgt_inp_tok) + self.pos_emb(pos)              # (B,L,E)
-        x = x + self.cond(enc_vec).unsqueeze(1)                        # (B,L,E)
-        h = self.in_proj(x)                                            # (B,L,H)
-
-        attn_mask = self._causal_mask(L, device=h.device)              # (L,L)
-        h = self.dec(h, mask=attn_mask)                                # (B,L,H)
-
-        z = self.bridge(h)                                             # (B,L,E)
-        Wc = self.tok_emb(cand_tok)                                    # (B,C,E)
-        logits_c = torch.einsum("ble,bce->blc", z, Wc)                 # (B,L,C)
-        return logits_c
-
-    @torch.no_grad()
-    def generate(self, enc_vec: torch.Tensor, topk: int, cand_tok: torch.Tensor, temperature: float = 0.0):
-        was_training = self.training
-        self.eval()
-        try:
-            B = enc_vec.size(0)
-            C = cand_tok.size(1)
-            used_c = torch.zeros((B, C), dtype=torch.bool, device=enc_vec.device)
-            used_c |= (cand_tok < 2)
-
-            out_tokens = []
-            for step in range(topk):
-                if step == 0:
-                    inp = torch.full((B, 1), 1, dtype=torch.long, device=enc_vec.device)  # BOS
-                else:
-                    bos = torch.full((B, 1), 1, dtype=torch.long, device=enc_vec.device)
-                    inp = torch.cat([bos, torch.stack(out_tokens, dim=1)], dim=1)         # (B, step+1)
-
-                logits_all = self(enc_vec, inp, cand_tok=cand_tok)       # (B, step+1, C)
-                logits = logits_all[:, -1].masked_fill(used_c, float("-inf"))
-
-                if temperature and temperature > 0:
-                    probs = F.softmax(logits / temperature, dim=-1)
-                    next_pos = torch.multinomial(probs, 1).squeeze(1)
-                else:
-                    next_pos = torch.argmax(logits, dim=-1)
-
-                next_tok = cand_tok.gather(1, next_pos.unsqueeze(1)).squeeze(1)
-                out_tokens.append(next_tok)
-                used_c.scatter_(1, next_pos.unsqueeze(1), True)
-
-            return torch.stack(out_tokens, dim=1)
-        finally:
-            self.train(was_training)
+    has_pos = pos_any.any(dim=1)
+    if has_pos.sum().item() == 0:
+        return logits.new_zeros(())
+    loss = -(log_num - log_denom)
+    return loss[has_pos].mean()
 
 
 # ---------------------- InfoNCE (multi-positive, in-batch negatives) ----------------------
@@ -479,7 +402,6 @@ def info_nce_multi_pos(
     q = F.normalize(q_emb, dim=-1)                        # (B,H)
     logits = (q @ a_pool.t()) / temperature               # (B,M)
 
-    # Build (B,M) positive mask by token match, safe for typical B<=1024, K<=50
     match = (pos_tok.unsqueeze(-1) == pool_tok.view(1, 1, -1)) & pos_mask.unsqueeze(-1)
     pos_any = match.any(dim=1)                            # (B,M)
 
@@ -524,12 +446,12 @@ class AgentTokenComposer(nn.Module):
         return e
 
 def init_tok_emb_from_bge_plus_ids(
-    gen,
-    vocab,
-    a_ids,
-    feature_dir,
-    device,
-    freeze_tok=False,
+    gen: OneStepGenerator,
+    vocab: AgentVocab,
+    a_ids: List[str],
+    feature_dir: str,
+    device: torch.device,
+    freeze_tok: bool = False,
     max_tool_per_agent: int = 8,
     init_chunk: int = 50000,
     use_fp16: bool = True,
@@ -621,7 +543,7 @@ def init_tok_emb_from_bge_plus_ids(
     return composer
 
 
-# ---------------------- Reward for DPO (GT-based, vectorized) ----------------------
+# ---------------------- GT reward (vectorized) ----------------------
 
 @torch.no_grad()
 def reward_from_gt_vectorized(
@@ -633,11 +555,9 @@ def reward_from_gt_vectorized(
     w_ndcg: float = 0.5,
 ) -> torch.Tensor:
     """
-    Vectorized GT reward:
-      reward = w_overlap * overlap + w_ndcg * nDCG@K
-    - overlap: precision-like hits/K (since pred length fixed K)
+    reward = w_overlap * overlap + w_ndcg * nDCG@K
+    - overlap: hits / K (precision-like since pred length fixed K)
     - nDCG@K: based on whether each predicted token appears in GT set
-    Complexity O(B*K*K) with K=topk (10) -> trivial.
     """
     device = pred_tok.device
     B, K = pred_tok.shape
@@ -646,27 +566,18 @@ def reward_from_gt_vectorized(
     gt_mask = (gt_tok != pad_tok) & (gt_tok >= offset)          # (B,K)
     pred_mask = (pred_tok != pad_tok) & (pred_tok >= offset)    # (B,K)
 
-    # hits[b, i] = 1 if pred_tok[b,i] appears in gt_tok[b,:]
-    # (B,K,K) compare, then any over last dim
     match = (pred_tok.unsqueeze(2) == gt_tok.unsqueeze(1)) & gt_mask.unsqueeze(1)
     hits = match.any(dim=2).float() * pred_mask.float()         # (B,K)
 
-    # overlap (precision-like)
     overlap = hits.sum(dim=1) / (pred_mask.float().sum(dim=1).clamp_min(1.0))  # (B,)
 
-    # DCG
     discounts = 1.0 / torch.log2(torch.arange(K, device=device).float() + 2.0)  # (K,)
     dcg = (hits * discounts.unsqueeze(0)).sum(dim=1)                            # (B,)
 
-    # IDCG: ideal hits are 1 for first min(|GT|, K) positions
     gt_counts = gt_mask.float().sum(dim=1).clamp_min(0.0)                       # (B,)
     ideal_k = torch.minimum(gt_counts, torch.tensor(float(K), device=device))   # (B,)
-    # idcg = sum_{i<ideal_k} discounts[i]
-    # compute cumulative discounts then gather
     cum_disc = torch.cumsum(discounts, dim=0)                                   # (K,)
-    # ideal_k is float; convert to int in [0..K]
     ideal_k_int = ideal_k.to(torch.long)
-    # idcg = cum_disc[ideal_k-1] when ideal_k>0 else 0
     idcg = torch.zeros((B,), device=device, dtype=torch.float32)
     pos = ideal_k_int - 1
     valid = ideal_k_int > 0
@@ -676,80 +587,96 @@ def reward_from_gt_vectorized(
     return w_overlap * overlap + w_ndcg * ndcg
 
 
-# ---------------------- Reward Model & Lite-DPO ----------------------
+# ---------------------- DPO (one-step, sampling w/o replacement) ----------------------
 
-class RewardModel(nn.Module):
-    def __init__(self, enc_dim: int, tok_emb: nn.Embedding, hidden: int = 512, freeze_tok: bool = True):
-        super().__init__()
-        if freeze_tok:
-            self.tok_emb = nn.Embedding.from_pretrained(tok_emb.weight.detach().clone(), freeze=True)
-        else:
-            self.tok_emb = tok_emb
-        self.ff = nn.Sequential(
-            nn.Linear(enc_dim + tok_emb.embedding_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden//2), nn.ReLU(),
-            nn.Linear(hidden//2, 1)
-        )
-        for m in self.ff:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight); nn.init.zeros_(m.bias)
+class DPOTrainerOneStep:
+    """
+    DPO logprob for a sampled ordered list under "sampling without replacement"
+    from a fixed logits vector over candidates.
 
-    def forward(self, enc_vec: torch.Tensor, tok_seq: torch.Tensor):
-        te = self.tok_emb(tok_seq)  # (B,L,E)
-        mask = (tok_seq >= 2).float().unsqueeze(-1)
-        te_sum = (te * mask).sum(dim=1)
-        denom = mask.sum(dim=1).clamp_min(1.0)
-        te_mean = te_sum / denom
-        x = torch.cat([enc_vec, te_mean], dim=1)
-        return self.ff(x).squeeze(1)
-
-class DPOTrainer:
-    def __init__(self, model, ref_model, beta: float = 0.1, pad_tok: int = 0):
+    This matches generate(... temperature>0) which does multinomial w/o replacement
+    from softmax(logits/temperature) after masking already-chosen items.
+    """
+    def __init__(self, model: OneStepGenerator, ref_model: OneStepGenerator, beta: float = 0.1, pad_tok: int = 0, offset: int = 2):
         self.model = model
         self.ref_model = ref_model
         self.beta = beta
         self.pad_tok = pad_tok
+        self.offset = offset
 
-    def seq_logprob_candidate_only(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model=None):
+    def _seq_logprob_under_model(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model: OneStepGenerator) -> torch.Tensor:
+        """
+        enc_vec: (B,H)
+        seq: (B,K) tokens (may include PAD at tail)
+        cand_tok: (B,C) tokens
+        returns: (B,) average logprob per non-pad token
+        """
+        B, K = seq.shape
+        _, C = cand_tok.shape
+
+        logits = model.score(enc_vec, cand_tok)  # (B,C)
+        invalid = (cand_tok < self.offset)       # PAD/BOS etc.
+        used = invalid.clone()
+
+        seq_mask = (seq != self.pad_tok) & (seq >= self.offset)  # (B,K)
+
+        lp_sum = torch.zeros((B,), device=seq.device, dtype=torch.float32)
+        cnt = torch.zeros((B,), device=seq.device, dtype=torch.float32)
+
+        for t in range(K):
+            active = seq_mask[:, t]
+            if active.sum().item() == 0:
+                continue
+
+            tok_t = seq[:, t]  # (B,)
+
+            eq = (cand_tok == tok_t.unsqueeze(1))  # (B,C)
+            has = eq.any(dim=1)
+            idx = eq.float().argmax(dim=1)         # (B,)
+
+            logits_t = logits.masked_fill(used, float("-inf"))  # (B,C)
+            log_denom = torch.logsumexp(logits_t, dim=1)         # (B,)
+
+            idx_safe = idx.clamp(0, C-1)
+            log_num = logits_t.gather(1, idx_safe.unsqueeze(1)).squeeze(1)  # (B,)
+            logp = log_num - log_denom
+
+            ok = active & has & torch.isfinite(logp)
+            lp_sum = lp_sum + torch.where(ok, logp, torch.zeros_like(logp))
+            cnt = cnt + ok.float()
+
+            used = used | eq
+
+        cnt = cnt.clamp_min(1.0)
+        return lp_sum / cnt
+
+    def seq_logprob(self, enc_vec: torch.Tensor, seq: torch.Tensor, cand_tok: torch.Tensor, model=None) -> torch.Tensor:
         model = self.model if model is None else model
-        B, L = seq.shape
-        bos = torch.full((B, 1), 1, dtype=torch.long, device=seq.device)
-        inp = torch.cat([bos, seq[:, :-1]], dim=1)  # teacher forcing input
+        return self._seq_logprob_under_model(enc_vec, seq, cand_tok, model)
 
-        logits_c = model(enc_vec, inp, cand_tok=cand_tok)  # (B,L,C)
-        lp = F.log_softmax(logits_c, dim=-1)               # (B,L,C)
-
-        local = remap_targets_to_cand(seq, cand_tok, pad_tok=self.pad_tok, ignore_index=-100)  # (B,L)
-        local_safe = local.clamp_min(0)
-        gather = lp.gather(-1, local_safe.unsqueeze(-1)).squeeze(-1)  # (B,L)
-        mask = (local != -100).float()
-        token_counts = mask.sum(dim=1).clamp_min(1.0)
-        lp_sum = (gather * mask).sum(dim=1)
-        return lp_sum / token_counts
-
-    def dpo_loss(self, enc_vec: torch.Tensor, pref_seq: torch.Tensor, nonpref_seq: torch.Tensor, cand_tok: torch.Tensor):
-        lp_pref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok)
-        lp_nonp = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok)
+    def dpo_loss(self, enc_vec: torch.Tensor, pref_seq: torch.Tensor, nonpref_seq: torch.Tensor, cand_tok: torch.Tensor) -> torch.Tensor:
+        lp_pref = self.seq_logprob(enc_vec, pref_seq, cand_tok, model=self.model)
+        lp_nonp = self.seq_logprob(enc_vec, nonpref_seq, cand_tok, model=self.model)
         with torch.no_grad():
-            lp_pref_ref = self.seq_logprob_candidate_only(enc_vec, pref_seq, cand_tok, model=self.ref_model)
-            lp_nonp_ref = self.seq_logprob_candidate_only(enc_vec, nonpref_seq, cand_tok, model=self.ref_model)
+            lp_pref_ref = self.seq_logprob(enc_vec, pref_seq, cand_tok, model=self.ref_model)
+            lp_nonp_ref = self.seq_logprob(enc_vec, nonpref_seq, cand_tok, model=self.ref_model)
 
         logratio = (lp_pref - lp_pref_ref) - (lp_nonp - lp_nonp_ref)
         return -F.logsigmoid(self.beta * logratio).mean()
 
 
-# ---------------------- Evaluation (candidate-only) ----------------------
+# ---------------------- Evaluation (candidate-only, one-step topK) ----------------------
 
 @torch.no_grad()
 def evaluate_model_gen(
-    gen_model,
+    gen_model: OneStepGenerator,
     enc_vecs_cpu: torch.Tensor,         # (Nq,H) on CPU
     qid2idx: Dict[str,int],
     a_ids: List[str],
     all_rankings: Dict[str, List[str]],
     eval_qids: List[str],
     device: torch.device,
-    ks=(10,),                           # IMPORTANT: tuple
+    ks=(10,),
     cand_size: int = 1000,
     rng_seed: int = 123,
     ref_k: Optional[int] = None,
@@ -767,7 +694,7 @@ def evaluate_model_gen(
     rnd = random.Random(rng_seed)
     vocab = AgentVocab(a_ids)
 
-    pbar = tqdm(eval_qids, desc="Evaluating (gen, sampled)", total=len(eval_qids))
+    pbar = tqdm(eval_qids, desc="Evaluating (one-step, sampled)", total=len(eval_qids))
     for i, qid in enumerate(pbar, start=1):
         k_pos = pos_topk_for_qid(qid, qid_to_part)
         gt_list = [aid for aid in all_rankings.get(qid, [])[:k_pos] if aid in all_agent_set]
@@ -820,6 +747,7 @@ def evaluate_model_gen(
 
         qi = qid2idx[qid]
         enc = enc_vecs_cpu[qi:qi+1].to(device, non_blocking=True)
+
         pred_tok = gen_model.generate(enc, topk=max(ks), cand_tok=cand_tok, temperature=0.0)
 
         pred_ids = []
@@ -862,32 +790,28 @@ def main():
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--max_features", type=int, default=TFIDF_MAX_FEATURES)
 
-    ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--batch_size", type=int, default=256)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight_decay", type=float, default=0.01)
-    ap.add_argument("--topk", type=int, default=10)
+    # shared
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--skip_eval", type=int, default=0)
+
+    # task / eval
+    ap.add_argument("--topk", type=int, default=EVAL_TOPK, help="Output top-K for inference and eval (keep 10).")
     ap.add_argument("--valid_ratio", type=float, default=0.2)
     ap.add_argument("--split_seed", type=int, default=42)
 
     # candidate building
     ap.add_argument("--train_mask", type=int, default=1,
                     help="1: use CPU TF-IDF retrieval as hard negatives; 0: random-only")
-    ap.add_argument("--candidate_size", type=int, default=200, help="C for training (>=topk)")
+    ap.add_argument("--candidate_size", type=int, default=200, help="C for training (>=topk and >=max positives)")
     ap.add_argument("--cand_extra", type=int, default=32, help="extra neighbors retrieved before trimming")
     ap.add_argument("--rand_neg_ratio", type=float, default=0.25,
                     help="When train_mask=1: fraction of candidate slots (excluding GT) filled by random negatives [0..1]")
-
     ap.add_argument("--eval_candidate_size", type=int, default=200)
 
     # model
     ap.add_argument("--enc_dim", type=int, default=512)
     ap.add_argument("--tok_dim", type=int, default=256)
-    ap.add_argument("--decoder", choices=["tx", "gru"], default="tx")
-    ap.add_argument("--hidden", type=int, default=512)
-    ap.add_argument("--num_layers", type=int, default=2)
-    ap.add_argument("--n_heads", type=int, default=8)
-    ap.add_argument("--max_len", type=int, default=64)
+    ap.add_argument("--gen_hidden", type=int, default=512)
     ap.add_argument("--dropout", type=float, default=0.1)
 
     # InfoNCE
@@ -895,7 +819,11 @@ def main():
     ap.add_argument("--nce_lambda", type=float, default=0.1)
     ap.add_argument("--nce_temp", type=float, default=0.07)
 
-    # AMP / perf
+    # optimizer / perf
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--batch_size", type=int, default=256)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--amp", type=int, default=1)
     ap.add_argument("--enc_chunk", type=int, default=1024)
     ap.add_argument("--nn_jobs", type=int, default=4)
@@ -913,16 +841,16 @@ def main():
     ap.add_argument("--eval_parts", type=str, default="PartI,PartII,PartIII")
 
     # mode
-    ap.add_argument("--mode", choices=["gen", "dpo"], default="gen")
+    ap.add_argument("--mode", choices=["sft", "dpo"], default="sft")
 
-    # dpo params
+    # DPO params
     ap.add_argument("--dpo_steps", type=int, default=1000)
     ap.add_argument("--dpo_batch", type=int, default=64)
     ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument("--dpo_lr", type=float, default=None)
     ap.add_argument("--freeze_q_enc_dpo", type=int, default=1)
 
-    # IMPORTANT: default=1 -> "one-labor" stable DPO by default
+    # default=1: stable "one-labor" GT-reward DPO
     ap.add_argument("--dpo_use_gt_reward", type=int, default=1,
                     help="1: use GT-based reward (overlap + nDCG) instead of learned RM during DPO (default=1)")
 
@@ -932,8 +860,20 @@ def main():
     ap.add_argument("--dpo_margin", type=float, default=0.01,
                     help="Skip pairs with |r_a-r_b| < margin to avoid noisy updates")
 
-    ap.add_argument("--seed", type=int, default=1234)
-    ap.add_argument("--skip_eval", type=int, default=0)
+    # DPO sampling temperatures
+    ap.add_argument("--dpo_temp_a", type=float, default=0.7)
+    ap.add_argument("--dpo_temp_b", type=float, default=1.3)
+
+    # NEW: DPO part-specific scope (and matching eval scope)
+    ap.add_argument(
+        "--dpo_part_scope",
+        type=str,
+        default="ALL",
+        choices=["ALL", "PartI", "PartII", "PartIII"],
+        help="DPO training/eval scope. "
+             "ALL: balanced sampler across parts (original). "
+             "PartI/PartII/PartIII: finetune on that part only and eval only on that part."
+    )
 
     args = ap.parse_args()
     eval_parts = [x.strip() for x in args.eval_parts.split(",") if x.strip()]
@@ -952,14 +892,13 @@ def main():
     if args.gt_reward_w_overlap + args.gt_reward_w_ndcg <= 0:
         raise ValueError("GT reward weights must sum to > 0.")
 
-    # normalize weights
     wsum = args.gt_reward_w_overlap + args.gt_reward_w_ndcg
     w_overlap = args.gt_reward_w_overlap / wsum
     w_ndcg = args.gt_reward_w_ndcg / wsum
 
     # ---------------- load data ----------------
     all_agents, all_questions, all_rankings, tools, qid_to_part = collect_data(args.data_root)
-    q_ids, q_texts, a_ids, a_texts, a_tool_lists = build_text_corpora(all_agents, all_questions, tools)
+    q_ids, q_texts, a_ids, a_texts, _ = build_text_corpora(all_agents, all_questions, tools)
     qid2idx = {qid:i for i,qid in enumerate(q_ids)}
     vocab = AgentVocab(a_ids)
 
@@ -1018,22 +957,16 @@ def main():
 
     # ---------------- models ----------------
     q_enc = QueryEncoder(d_q=Q_csr.shape[1], hidden=args.enc_dim, dropout=args.dropout).to(device)
+    gen = OneStepGenerator(
+        enc_dim=args.enc_dim,
+        vocab_size=vocab.vocab_size,
+        tok_dim=args.tok_dim,
+        hidden=args.gen_hidden,
+        dropout=args.dropout
+    ).to(device)
 
-    if args.decoder == "gru":
-        gen = OneRecPlusGRU(
-            enc_dim=args.enc_dim, vocab_size=vocab.vocab_size,
-            hidden=args.hidden, num_layers=args.num_layers, tok_dim=args.tok_dim
-        ).to(device)
-    else:
-        gen = OneRecPlusTransformer(
-            enc_dim=args.enc_dim, vocab_size=vocab.vocab_size,
-            hidden=args.hidden, n_heads=args.n_heads, n_layers=args.num_layers,
-            tok_dim=args.tok_dim, max_len=args.max_len, dropout=args.dropout
-        ).to(device)
-
-    composer = None
     if args.init_tok_from_bge and args.bge_feature_dir:
-        composer = init_tok_emb_from_bge_plus_ids(
+        _ = init_tok_emb_from_bge_plus_ids(
             gen, vocab, a_ids, args.bge_feature_dir, device,
             freeze_tok=bool(args.freeze_tok_emb),
             max_tool_per_agent=args.max_tool_per_agent,
@@ -1046,18 +979,40 @@ def main():
             p.requires_grad = False
         print("[tok-init] frozen gen.tok_emb")
 
+    # ---------------- training targets ----------------
+    def build_targets(qids: List[str]) -> Tuple[List[str], List[List[int]]]:
+        """
+        Always returns length=args.topk token list (PAD padded).
+        Positives count varies by part via pos_topk_for_qid(qid, qid_to_part).
+        """
+        in_q = []
+        tgt_tok = []
+        for qid in qids:
+            k_pos = min(args.topk, pos_topk_for_qid(qid, qid_to_part))
+            ranked = [aid for aid in all_rankings.get(qid, [])[:k_pos] if aid in vocab.aid2tok]
+            if not ranked:
+                continue
+            toks = [vocab.aid_to_token(a) for a in ranked]
+            if len(toks) < args.topk:
+                toks += [vocab.PAD] * (args.topk - len(toks))
+            in_q.append(qid)
+            tgt_tok.append(toks)
+        return in_q, tgt_tok
+
+    train_q, train_targets = build_targets(train_qids)
+    valid_q, valid_targets = build_targets(valid_qids)
+    print(f"[train] sequences={len(train_q)}  valid={len(valid_q)}  topk={args.topk}")
+
     # ---------------- candidate builder (GT + hard + random) ----------------
     def build_cand_tok_batch(
         qid_batch: List[str],
-        tgt_tok: torch.Tensor,              # (B,topk) full-vocab targets
+        tgt_tok: torch.Tensor,              # (B,topk) full-vocab targets (PAD padded)
         use_retrieval: bool
     ) -> torch.Tensor:
         """
-        Return cand_tok: (B,C) full-vocab token ids (agent tokens), padded with PAD.
-        Always inserts GT tokens first.
-        If use_retrieval:
-          - fill remaining with hard negatives from TF-IDF retrieval
-          - then fill a fraction with random negatives (rand_neg_ratio)
+        Return cand_tok: (B,C) full-vocab token ids, PAD padded.
+        Always inserts ALL GT tokens first (unique).
+        Then fills remaining with hard negatives (TF-IDF) and random negatives.
         """
         B = tgt_tok.size(0)
         C = args.candidate_size
@@ -1082,7 +1037,7 @@ def main():
                 rand_slots = int(round(rem * args.rand_neg_ratio)) if use_retrieval else rem
                 hard_slots = rem - rand_slots
 
-                # hard negatives (retrieved)
+                # hard negatives
                 if use_retrieval and hard_slots > 0:
                     for aidx in top_idx[i].tolist():
                         t = vocab.offset + int(aidx)
@@ -1118,48 +1073,39 @@ def main():
 
         return torch.tensor(cand_list, dtype=torch.long, device=device)
 
-    # ---------------- training targets ----------------
-    def build_targets(qids: List[str]) -> Tuple[List[str], List[List[int]]]:
-        in_q = []; tgt_tok = []
-        for qid in qids:
-            k_pos = min(args.topk, pos_topk_for_qid(qid, qid_to_part))
-            ranked = [aid for aid in all_rankings.get(qid, [])[:k_pos] if aid in vocab.aid2tok]
-            if not ranked:
-                continue
-            toks = [vocab.aid_to_token(a) for a in ranked]
-            if len(toks) < args.topk:
-                toks += [vocab.PAD]*(args.topk - len(toks))
-            in_q.append(qid); tgt_tok.append(toks)
-        return in_q, tgt_tok
-
-    train_q, train_targets = build_targets(train_qids)
-    valid_q, valid_targets = build_targets(valid_qids)
-    print(f"[train] sequences={len(train_q)}  valid={len(valid_q)}  topk={args.topk}")
-
     # ---------------- checkpoints ----------------
     data_sig = dataset_signature(a_ids, all_rankings)
     cache_dir = ensure_cache_dir(args.data_root)
     model_dir = os.path.join(cache_dir, "models"); os.makedirs(model_dir, exist_ok=True)
+
+    # base SFT path (same as before)
     model_path = os.path.join(model_dir, f"{filename}_{data_sig}.pt")
     meta_path = os.path.join(model_dir, f"meta_{data_sig}.json")
 
+    # suffix helper for DPO outputs
+    def part_suffix() -> str:
+        return "" if args.dpo_part_scope == "ALL" else f"_{args.dpo_part_scope}"
+
     # ---------------- optim / scaler ----------------
-    def build_optimizer(params):
-        return torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    def build_optimizer(params, lr: float):
+        return torch.optim.AdamW(params, lr=lr, weight_decay=args.weight_decay)
 
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-    # ===================== GEN =====================
-    if args.mode == "gen":
+    # ===================== SFT =====================
+    if args.mode == "sft":
         params = [p for p in list(q_enc.parameters()) + list(gen.parameters()) if p.requires_grad]
-        opt = build_optimizer(params)
+        opt = build_optimizer(params, lr=args.lr)
 
         nb = math.ceil(len(train_q) / args.batch_size)
-        for epoch in range(1, args.epochs+1):
-            order = list(range(len(train_q))); random.shuffle(order)
+        for epoch in range(1, args.epochs + 1):
+            order = list(range(len(train_q)))
+            random.shuffle(order)
+
             total_ce = 0.0
             total_nce = 0.0
-            pbar = tqdm(range(nb), desc=f"Epoch {epoch}/{args.epochs} [GEN/{args.decoder}]")
+
+            pbar = tqdm(range(nb), desc=f"Epoch {epoch}/{args.epochs} [SFT one-step]")
             for b in pbar:
                 sl = order[b*args.batch_size:(b+1)*args.batch_size]
                 if not sl:
@@ -1167,25 +1113,22 @@ def main():
 
                 qid_batch = [train_q[i] for i in sl]
                 tgt = torch.tensor([train_targets[i] for i in sl], dtype=torch.long, device=device)  # (B,topk)
-                B = tgt.size(0)
-
-                bos = torch.full((B,1), vocab.BOS, dtype=torch.long, device=device)
-                inp = torch.cat([bos, tgt[:, :-1]], dim=1)  # (B,topk)
 
                 q_x = build_query_tensor(qid_batch).to(device, non_blocking=True)  # (B,Dq)
-                cand_tok = build_cand_tok_batch(qid_batch, tgt_tok=tgt, use_retrieval=bool(args.train_mask))
+                cand_tok = build_cand_tok_batch(qid_batch, tgt_tok=tgt, use_retrieval=bool(args.train_mask))  # (B,C)
 
                 opt.zero_grad(set_to_none=True)
 
                 with torch.cuda.amp.autocast(enabled=use_amp):
-                    enc_vec = q_enc(q_x)                              # (B,H)
-                    logits_c = gen(enc_vec, inp, cand_tok=cand_tok)   # (B,L,C)
+                    enc_vec = q_enc(q_x)                       # (B,H)
+                    logits = gen.score(enc_vec, cand_tok)      # (B,C)
 
-                    tgt_local = remap_targets_to_cand(tgt, cand_tok, pad_tok=vocab.PAD, ignore_index=-100)
-                    loss_ce = F.cross_entropy(
-                        logits_c.reshape(-1, logits_c.size(-1)),
-                        tgt_local.reshape(-1),
-                        ignore_index=-100
+                    loss_ce = multi_pos_softmax_loss(
+                        logits=logits,
+                        cand_tok=cand_tok,
+                        gt_tok=tgt,
+                        pad_tok=vocab.PAD,
+                        offset=vocab.offset,
                     )
 
                     if args.use_nce:
@@ -1223,8 +1166,7 @@ def main():
 
         # save
         ckpt = {
-            "mode": "gen",
-            "decoder": args.decoder,
+            "mode": "sft",
             "q_enc": q_enc.state_dict(),
             "gen": gen.state_dict(),
             "data_sig": data_sig,
@@ -1263,12 +1205,12 @@ def main():
                 all_rankings=all_rankings,
                 eval_qids=eval_qids,
                 device=device,
-                ks=(10,),   # FIXED
+                ks=(args.topk,),
                 cand_size=args.eval_candidate_size,
                 rng_seed=args.seed,
                 qid_to_part=qid_to_part,
             )
-            print_metrics_table(f"Validation (GEN/{args.decoder}, per-part sampled)", valid_metrics, ks=(10,), filename=filename)
+            print_metrics_table("Validation (SFT one-step, per-part sampled)", valid_metrics, ks=(args.topk,), filename=filename)
 
             for part in eval_parts:
                 part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
@@ -1282,19 +1224,18 @@ def main():
                     all_rankings=all_rankings,
                     eval_qids=part_qids,
                     device=device,
-                    ks=(10,),  # FIXED
+                    ks=(args.topk,),
                     cand_size=args.eval_candidate_size,
                     rng_seed=args.seed + 17,
                     qid_to_part=qid_to_part,
                 )
-                print_metrics_table(f"Validation (GEN/{args.decoder}) {part} (n={len(part_qids)})", m_part,ks=(10,),  filename=filename)
+                print_metrics_table(f"Validation (SFT one-step) {part} (n={len(part_qids)})", m_part, ks=(args.topk,), filename=filename)
 
     # ===================== DPO =====================
     if args.mode == "dpo":
-        assert os.path.exists(model_path), f"CE checkpoint not found: {model_path}"
+        # load SFT checkpoint
+        assert os.path.exists(model_path), f"SFT checkpoint not found: {model_path}"
         ckpt = torch.load(model_path, map_location=device)
-
-        print(f"[load] ckpt decoder={ckpt.get('decoder','?')}  current decoder={args.decoder}")
 
         q_enc.load_state_dict(ckpt["q_enc"])
         gen.load_state_dict(ckpt["gen"])
@@ -1305,133 +1246,93 @@ def main():
         for p in gen_ref.parameters():
             p.requires_grad = False
 
-        rm = None
+        # Only GT-reward DPO
         if not bool(args.dpo_use_gt_reward):
-            rm = RewardModel(enc_dim=args.enc_dim, tok_emb=gen.tok_emb, hidden=512, freeze_tok=True).to(device)
+            raise ValueError("This script is configured for GT-reward DPO (set --dpo_use_gt_reward 1).")
 
-        dpo = DPOTrainer(model=gen, ref_model=gen_ref, beta=args.beta, pad_tok=vocab.PAD)
-
-        scaler_rm = torch.cuda.amp.GradScaler(enabled=use_amp) if rm is not None else None
+        dpo = DPOTrainerOneStep(model=gen, ref_model=gen_ref, beta=args.beta, pad_tok=vocab.PAD, offset=vocab.offset)
         scaler_dpo = torch.cuda.amp.GradScaler(enabled=use_amp)
 
-        # Use SAME filtered training set as SFT (only queries with valid GT)
-        dpo_q = train_q
-        dpo_tgt = train_targets
-        assert len(dpo_q) == len(dpo_tgt) and len(dpo_q) > 0
+        # -------- build DPO train/valid by scope --------
+        if args.dpo_part_scope == "ALL":
+            # Use SAME filtered training set as SFT (only queries with valid GT)
+            dpo_q = train_q
+            dpo_tgt = train_targets
+            # evaluation scope defaults to args.eval_parts (unchanged)
+            dpo_eval_parts = eval_parts
+            print(f"[DPO] scope=ALL (balanced across parts). train_n={len(dpo_q)}")
+        else:
+            scope = args.dpo_part_scope
+            # filter on already-built (train_q, valid_q) which have valid GT
+            dpo_q = [qid for qid in train_q if qid_to_part.get(qid, "Unknown") == scope]
+            dpo_tgt = [train_targets[i] for i, qid in enumerate(train_q) if qid_to_part.get(qid, "Unknown") == scope]
+            dpo_eval_parts = [scope]
+            print(f"[DPO] scope={scope} (part-specific). train_n={len(dpo_q)}")
 
-        # -------- strict balanced sampler across parts (incl remainder) --------
-        dpo_part_buckets: Dict[str, List[int]] = defaultdict(list)
-        for idx, qid in enumerate(dpo_q):
-            part = qid_to_part.get(qid, "Unknown")
-            dpo_part_buckets[part].append(idx)
+        assert len(dpo_q) == len(dpo_tgt) and len(dpo_q) > 0, \
+            f"[DPO] no training samples found under scope={args.dpo_part_scope}. Check qid_to_part mapping."
 
-        # Prefer known parts first (optional)
-        prefer_order = ["PartI", "PartII", "PartIII"]
-        parts_all = list(dpo_part_buckets.keys())
-        dpo_parts = [p for p in prefer_order if p in dpo_part_buckets] + [p for p in sorted(parts_all) if p not in prefer_order]
-
+        # -------- sampler --------
         dpo_rng = random.Random(args.seed + 20250101)
 
-        def sample_balanced_indices(batch_size: int) -> List[int]:
-            """
-            Strict-ish balanced sampling:
-              - base = batch_size // P per part
-              - remainder distributed uniformly over parts
-              - if a part has insufficient pool, sample with replacement
-            This prevents any dominant part from "eating" the remainder.
-            """
-            if batch_size <= 0:
-                return []
-            P = max(1, len(dpo_parts))
-            base = batch_size // P
-            rem = batch_size - base * P
+        if args.dpo_part_scope == "ALL":
+            # strict balanced sampler across parts (original)
+            dpo_part_buckets: Dict[str, List[int]] = defaultdict(list)
+            for idx, qid in enumerate(dpo_q):
+                part = qid_to_part.get(qid, "Unknown")
+                dpo_part_buckets[part].append(idx)
 
-            # distribute remainder uniformly across parts
-            extra = [0] * P
-            for j in dpo_rng.sample(range(P), rem) if rem > 0 else []:
-                extra[j] += 1
+            prefer_order = ["PartI", "PartII", "PartIII"]
+            parts_all = list(dpo_part_buckets.keys())
+            dpo_parts = [p for p in prefer_order if p in dpo_part_buckets] + [p for p in sorted(parts_all) if p not in prefer_order]
 
-            indices: List[int] = []
-            for j, part in enumerate(dpo_parts):
-                pool = dpo_part_buckets.get(part, [])
-                take = base + extra[j]
-                if take <= 0:
-                    continue
-                if len(pool) == 0:
-                    continue
-                if len(pool) >= take:
-                    indices.extend(dpo_rng.sample(pool, take))
-                else:
-                    # sample with replacement to keep balance
-                    indices.extend(dpo_rng.sample(pool, len(pool)))
-                    while len(pool) > 0 and (take - len(pool)) > 0:
-                        indices.append(dpo_rng.choice(pool))
-                        take -= 1
+            def sample_indices(batch_size: int) -> List[int]:
+                if batch_size <= 0:
+                    return []
+                P = max(1, len(dpo_parts))
+                base = batch_size // P
+                rem = batch_size - base * P
 
-            # if something went wrong (rare), fallback fill from all
-            if len(indices) < batch_size:
-                all_pool = [i for lst in dpo_part_buckets.values() for i in lst]
-                need = batch_size - len(indices)
-                if len(all_pool) > 0:
-                    for _ in range(need):
-                        indices.append(dpo_rng.choice(all_pool))
+                extra = [0] * P
+                for j in dpo_rng.sample(range(P), rem) if rem > 0 else []:
+                    extra[j] += 1
 
-            if len(indices) > batch_size:
-                indices = dpo_rng.sample(indices, batch_size)
+                indices: List[int] = []
+                for j, part in enumerate(dpo_parts):
+                    pool = dpo_part_buckets.get(part, [])
+                    take = base + extra[j]
+                    if take <= 0 or len(pool) == 0:
+                        continue
+                    if len(pool) >= take:
+                        indices.extend(dpo_rng.sample(pool, take))
+                    else:
+                        indices.extend(dpo_rng.sample(pool, len(pool)))
+                        while len(pool) > 0 and (take - len(pool)) > 0:
+                            indices.append(dpo_rng.choice(pool))
+                            take -= 1
 
-            dpo_rng.shuffle(indices)
-            return indices
+                if len(indices) < batch_size:
+                    all_pool = [i for lst in dpo_part_buckets.values() for i in lst]
+                    need = batch_size - len(indices)
+                    if len(all_pool) > 0:
+                        for _ in range(need):
+                            indices.append(dpo_rng.choice(all_pool))
 
-        # -------- optional RM pretrain (only if not using GT reward) --------
-        if rm is not None:
-            print("[RM] Pretraining reward model...")
-            opt_rm = torch.optim.AdamW(rm.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-            rm_steps = max(500, args.dpo_steps // 4)
+                if len(indices) > batch_size:
+                    indices = dpo_rng.sample(indices, batch_size)
 
-            for step in tqdm(range(rm_steps), desc="RM pretrain"):
-                sl = sample_balanced_indices(args.dpo_batch)
-                batch_q = [dpo_q[i] for i in sl]
-                gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
-
-                cand_tok = build_cand_tok_batch(batch_q, tgt_tok=gt_tok, use_retrieval=bool(args.train_mask))
-                q_x = build_query_tensor(batch_q).to(device, non_blocking=True)
-
-                opt_rm.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=use_amp):
-                    enc = q_enc(q_x)
-                    seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=0.7)
-                    seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
-
-                    rnd_tok = []
-                    for _ in batch_q:
-                        kk = args.topk
-                        ids = [vocab.offset + random.randrange(len(a_ids)) for _ in range(kk)]
-                        rnd_tok.append(ids)
-                    rnd_tok = torch.tensor(rnd_tok, dtype=torch.long, device=device)
-
-                    r_pos = rm(enc, gt_tok)
-                    r_rand = rm(enc, rnd_tok)
-                    r_a = rm(enc, seq_a)
-                    r_b = rm(enc, seq_b)
-
-                    loss_rm = (
-                        F.softplus(-(r_pos - r_rand)) +
-                        F.softplus(-(r_pos - r_a)) +
-                        F.softplus(-(r_pos - r_b))
-                    ).mean()
-
-                scaler_rm.scale(loss_rm).backward()
-                scaler_rm.unscale_(opt_rm)
-                torch.nn.utils.clip_grad_norm_(rm.parameters(), 1.0)
-                scaler_rm.step(opt_rm)
-                scaler_rm.update()
-
-            print("[RM] done.")
-            rm.eval()
-            for p in rm.parameters():
-                p.requires_grad = False
+                dpo_rng.shuffle(indices)
+                return indices
         else:
-            print("[RM] skipped (using GT-based reward for DPO).")
+            # part-specific: simple uniform sampling from this part only
+            def sample_indices(batch_size: int) -> List[int]:
+                n = len(dpo_q)
+                if n == 0 or batch_size <= 0:
+                    return []
+                if n >= batch_size:
+                    return dpo_rng.sample(range(n), batch_size)
+                # with replacement
+                return [dpo_rng.randrange(n) for _ in range(batch_size)]
 
         # optionally freeze query encoder during DPO
         if args.freeze_q_enc_dpo:
@@ -1443,36 +1344,29 @@ def main():
             q_enc.train()
 
         lr_dpo = args.dpo_lr if args.dpo_lr is not None else args.lr * 0.1
-        opt_dpo = torch.optim.AdamW(
-            [p for p in gen.parameters() if p.requires_grad],
-            lr=lr_dpo,
-            weight_decay=args.weight_decay
-        )
+        opt_dpo = build_optimizer([p for p in gen.parameters() if p.requires_grad], lr=lr_dpo)
 
         update_steps = 0
         skipped_keep = 0
-        for step in tqdm(range(args.dpo_steps), desc="Lite-DPO"):
-            sl = sample_balanced_indices(args.dpo_batch)
+
+        for step in tqdm(range(args.dpo_steps), desc=f"DPO (one-step{part_suffix()})"):
+            sl = sample_indices(args.dpo_batch)
             batch_q = [dpo_q[i] for i in sl]
-            gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
+            gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)  # (B,K)
 
             cand_tok = build_cand_tok_batch(batch_q, tgt_tok=gt_tok, use_retrieval=bool(args.train_mask))
             q_x = build_query_tensor(batch_q).to(device, non_blocking=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
                 enc = q_enc(q_x)
-                seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=0.7)
-                seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
+                seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=float(args.dpo_temp_a))
+                seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=float(args.dpo_temp_b))
 
             with torch.no_grad():
-                if rm is not None:
-                    r_a = rm(enc, seq_a)
-                    r_b = rm(enc, seq_b)
-                else:
-                    r_a = reward_from_gt_vectorized(seq_a, gt_tok, pad_tok=vocab.PAD, offset=vocab.offset,
-                                                    w_overlap=w_overlap, w_ndcg=w_ndcg)
-                    r_b = reward_from_gt_vectorized(seq_b, gt_tok, pad_tok=vocab.PAD, offset=vocab.offset,
-                                                    w_overlap=w_overlap, w_ndcg=w_ndcg)
+                r_a = reward_from_gt_vectorized(seq_a, gt_tok, pad_tok=vocab.PAD, offset=vocab.offset,
+                                                w_overlap=w_overlap, w_ndcg=w_ndcg)
+                r_b = reward_from_gt_vectorized(seq_b, gt_tok, pad_tok=vocab.PAD, offset=vocab.offset,
+                                                w_overlap=w_overlap, w_ndcg=w_ndcg)
 
                 prefer_a = (r_a >= r_b)
                 keep = (r_a - r_b).abs() >= float(args.dpo_margin)
@@ -1493,6 +1387,7 @@ def main():
 
             gen.train()
             opt_dpo.zero_grad(set_to_none=True)
+
             with torch.cuda.amp.autocast(enabled=use_amp):
                 loss = dpo.dpo_loss(enc_keep, pref_seq, nonpref_seq, cand_keep)
 
@@ -1507,30 +1402,45 @@ def main():
                 tqdm.write(f"[DPO] update {update_steps} (step {step+1}/{args.dpo_steps}) loss={loss.item():.4f} skipped_keep={skipped_keep}")
 
         ckpt_out = {
-            "mode": "gen+dpo",
-            "decoder": args.decoder,
+            "mode": f"sft+dpo{part_suffix()}",
+            "dpo_part_scope": args.dpo_part_scope,
             "q_enc": q_enc.state_dict(),
             "gen": gen.state_dict(),
             "data_sig": data_sig,
             "saved_at": datetime.now().isoformat(timespec="seconds")
         }
-        out_path = model_path.replace(".pt", "_dpo.pt")
+        out_path = model_path.replace(".pt", f"_dpo{part_suffix()}.pt")
         torch.save(ckpt_out, out_path)
         print(f"[save] dpo model -> {out_path}")
 
-        # quick eval
+        # eval (scope-aware)
         if not bool(args.skip_eval):
             print("[eval] encoding all queries...")
             enc_all = encode_queries_in_chunks(q_ids, chunk=args.enc_chunk)
 
-            eval_qids = sample_qids_by_part(
-                valid_qids,
-                qid_to_part=qid_to_part,
-                per_part=args.eval_per_part,
-                seed=args.seed,
-                parts=eval_parts
-            )
-            print(f"[eval] valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part})")
+            # select eval_qids:
+            # - If part-specific, evaluate ONLY that part on validation split
+            # - If ALL, keep original behavior (sample per-part from valid_qids, using args.eval_parts)
+            if args.dpo_part_scope == "ALL":
+                eval_qids = sample_qids_by_part(
+                    valid_qids,
+                    qid_to_part=qid_to_part,
+                    per_part=args.eval_per_part,
+                    seed=args.seed,
+                    parts=eval_parts
+                )
+                print(f"[eval] scope=ALL valid_qids={len(valid_qids)} -> sampled_eval={len(eval_qids)} (per_part={args.eval_per_part}) parts={eval_parts}")
+            else:
+                scope = args.dpo_part_scope
+                valid_scope = [q for q in valid_qids if qid_to_part.get(q, "Unknown") == scope]
+                # keep your sampling knob: take up to eval_per_part (for this single part)
+                if args.eval_per_part > 0:
+                    rnd = random.Random(args.seed)
+                    rnd.shuffle(valid_scope)
+                    eval_qids = valid_scope[: min(args.eval_per_part, len(valid_scope))]
+                else:
+                    eval_qids = valid_scope
+                print(f"[eval] scope={scope} valid_scope={len(valid_scope)} -> eval_n={len(eval_qids)} (eval_per_part={args.eval_per_part})")
 
             valid_metrics = evaluate_model_gen(
                 gen_model=gen,
@@ -1540,31 +1450,33 @@ def main():
                 all_rankings=all_rankings,
                 eval_qids=eval_qids,
                 device=device,
-                ks=(10,),  # FIXED
+                ks=(args.topk,),
                 cand_size=args.eval_candidate_size,
                 rng_seed=args.seed,
                 qid_to_part=qid_to_part,
             )
-            print_metrics_table(f"Validation (GEN/{args.decoder}+DPO, per-part sampled)", valid_metrics, ks=(10,), filename=filename)
+            print_metrics_table(f"Validation (SFT+DPO one-step{part_suffix()}, sampled)", valid_metrics, ks=(args.topk,), filename=filename)
 
-            for part in eval_parts:
-                part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
-                if not part_qids:
-                    continue
-                m_part = evaluate_model_gen(
-                    gen_model=gen,
-                    enc_vecs_cpu=enc_all,
-                    qid2idx=qid2idx,
-                    a_ids=a_ids,
-                    all_rankings=all_rankings,
-                    eval_qids=part_qids,
-                    device=device,
-                    ks=(10,),  # FIXED
-                    cand_size=args.eval_candidate_size,
-                    rng_seed=args.seed + 17,
-                    qid_to_part=qid_to_part,
-                )
-                print_metrics_table(f"Validation (GEN/{args.decoder}+DPO) {part} (n={len(part_qids)})", m_part,ks=(10,), filename=filename)
+            # If ALL, still print per-part breakdown as before; if part-specific, this is redundant so skip.
+            if args.dpo_part_scope == "ALL":
+                for part in eval_parts:
+                    part_qids = [q for q in eval_qids if qid_to_part.get(q, "Unknown") == part]
+                    if not part_qids:
+                        continue
+                    m_part = evaluate_model_gen(
+                        gen_model=gen,
+                        enc_vecs_cpu=enc_all,
+                        qid2idx=qid2idx,
+                        a_ids=a_ids,
+                        all_rankings=all_rankings,
+                        eval_qids=part_qids,
+                        device=device,
+                        ks=(args.topk,),
+                        cand_size=args.eval_candidate_size,
+                        rng_seed=args.seed + 17,
+                        qid_to_part=qid_to_part,
+                    )
+                    print_metrics_table(f"Validation (SFT+DPO one-step) {part} (n={len(part_qids)})", m_part, ks=(args.topk,), filename=filename)
 
 
 if __name__ == "__main__":

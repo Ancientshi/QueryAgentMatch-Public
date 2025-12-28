@@ -13,7 +13,7 @@ HID="${HID:-256}"
 TEMPERATURE="${TEMPERATURE:-0.07}"
 EVAL_CHUNK="${EVAL_CHUNK:-8192}"
 USE_TOOL_ID_EMB="${USE_TOOL_ID_EMB:-${USE_TOOL_EMB:-1}}"
-USE_LLM_ID_EMB="${USE_LLM_ID_EMB:-${USE_AGENT_ID_EMB:-1}}"
+USE_LLM_ID_EMB="${USE_LLM_ID_EMB:-${USE_AGENT_ID_EMB:-0}}"
 USE_MODEL_CONTENT_VECTOR="${USE_MODEL_CONTENT_VECTOR:-1}"
 USE_TOOL_CONTENT_VECTOR="${USE_TOOL_CONTENT_VECTOR:-1}"
 USE_QUERY_ID_EMB="${USE_QUERY_ID_EMB:-0}"
@@ -35,4 +35,4 @@ python "$SCRIPT_DIR/../../run_twotower_tfidf.py" \
   --use_model_content_vector "$USE_MODEL_CONTENT_VECTOR" \
   --use_tool_content_vector "$USE_TOOL_CONTENT_VECTOR" \
   --use_query_id_emb "$USE_QUERY_ID_EMB" \
-  --exp_name "two_tower_tfidf_modelid_toolid"
+  --exp_name "two_tower_tfidf_toolid"
