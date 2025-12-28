@@ -620,6 +620,38 @@ def init_tok_emb_from_bge_plus_ids(
 
 # ---------------------- Reward Model & Lite-DPO ----------------------
 
+def reward_from_gt(
+    pred_tok: torch.Tensor,     # (B, L) candidate tokens
+    gt_tok: torch.Tensor,       # (B, L) ground-truth tokens (padded)
+    pad_tok: int,
+    offset: int,
+) -> torch.Tensor:
+    """
+    Compute a simple reward from ground-truth targets:
+      reward = 0.5 * overlap + 0.5 * nDCG
+    """
+    rewards: List[float] = []
+    B, _ = pred_tok.shape
+    for i in range(B):
+        gt = [t for t in gt_tok[i].tolist() if t >= offset and t != pad_tok]
+        pred = [t for t in pred_tok[i].tolist() if t >= offset and t != pad_tok]
+        if not gt or not pred:
+            rewards.append(0.0)
+            continue
+
+        rel = set(gt)
+        hits = [1 if t in rel else 0 for t in pred]
+        overlap = sum(hits) / float(len(pred))
+
+        dcg = _dcg_at_k(hits, len(pred))
+        ideal_hits = [1] * min(len(gt), len(pred))
+        idcg = _dcg_at_k(ideal_hits, len(pred))
+        ndcg = (dcg / idcg) if idcg > 0 else 0.0
+
+        rewards.append(0.5 * overlap + 0.5 * ndcg)
+
+    return torch.tensor(rewards, device=pred_tok.device, dtype=torch.float32)
+
 class RewardModel(nn.Module):
     def __init__(self, enc_dim: int, tok_emb: nn.Embedding, hidden: int = 512, freeze_tok: bool = True):
         super().__init__()
@@ -863,6 +895,9 @@ def main():
     ap.add_argument("--beta", type=float, default=0.05)
     ap.add_argument("--dpo_lr", type=float, default=None)
     ap.add_argument("--freeze_q_enc_dpo", type=int, default=1)
+
+    ap.add_argument("--dpo_use_gt_reward", type=int, default=0,
+                    help="1: use GT-based reward (overlap + nDCG) instead of learned RM during DPO")
 
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--skip_eval", type=int, default=0)
@@ -1234,10 +1269,12 @@ def main():
         for p in gen_ref.parameters():
             p.requires_grad = False
 
-        rm = RewardModel(enc_dim=args.enc_dim, tok_emb=gen.tok_emb, hidden=512, freeze_tok=True).to(device)
+        rm = None
+        if not args.dpo_use_gt_reward:
+            rm = RewardModel(enc_dim=args.enc_dim, tok_emb=gen.tok_emb, hidden=512, freeze_tok=True).to(device)
         dpo = DPOTrainer(model=gen, ref_model=gen_ref, beta=args.beta, pad_tok=vocab.PAD)
 
-        scaler_rm = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler_rm = torch.cuda.amp.GradScaler(enabled=use_amp) if rm is not None else None
         scaler_dpo = torch.cuda.amp.GradScaler(enabled=use_amp)
 
         # RM pretrain
@@ -1246,53 +1283,85 @@ def main():
         dpo_tgt = train_targets
         assert len(dpo_q) == len(dpo_tgt) and len(dpo_q) > 0
 
-        print("[RM] Pretraining reward model...")
-        opt_rm = torch.optim.AdamW(rm.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        rm_steps = max(500, args.dpo_steps // 4)
-        train_pool = [qid for qid in train_qids if qid in qid2idx]
+        dpo_part_buckets = defaultdict(list)
+        for idx, qid in enumerate(dpo_q):
+            dpo_part_buckets[qid_to_part.get(qid, "Unknown")].append(idx)
+        dpo_parts = sorted(dpo_part_buckets.keys())
 
-        for step in tqdm(range(rm_steps), desc="RM pretrain"):
-            sl = random.sample(range(len(dpo_q)), min(args.dpo_batch, len(dpo_q)))
-            batch_q = [dpo_q[i] for i in sl]
-            gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
+        def sample_balanced_indices(batch_size: int) -> List[int]:
+            if not dpo_part_buckets:
+                return random.sample(range(len(dpo_q)), min(batch_size, len(dpo_q)))
 
-            cand_tok = build_cand_tok_batch(batch_q, tgt_tok=gt_tok, use_retrieval=bool(args.train_mask))
-            q_x = build_query_tensor(batch_q).to(device, non_blocking=True)
+            per_part = max(1, batch_size // max(1, len(dpo_parts)))
+            indices: List[int] = []
+            for part in dpo_parts:
+                pool = dpo_part_buckets.get(part, [])
+                if not pool:
+                    continue
+                take = min(per_part, len(pool))
+                indices.extend(random.sample(pool, take))
 
-            opt_rm.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                enc = q_enc(q_x)
-                seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=0.7)
-                seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
+            if len(indices) < batch_size:
+                remaining = [i for lst in dpo_part_buckets.values() for i in lst if i not in indices]
+                need = min(batch_size - len(indices), len(remaining))
+                if need > 0:
+                    indices.extend(random.sample(remaining, need))
 
-                rnd_tok = []
-                for _ in batch_q:
-                    kk = args.topk
-                    ids = [vocab.offset + random.randrange(len(a_ids)) for _ in range(kk)]
-                    rnd_tok.append(ids)
-                rnd_tok = torch.tensor(rnd_tok, dtype=torch.long, device=device)
+            if len(indices) > batch_size:
+                indices = random.sample(indices, batch_size)
 
-                r_pos = rm(enc, gt_tok)
-                r_rand = rm(enc, rnd_tok)
-                r_a = rm(enc, seq_a)
-                r_b = rm(enc, seq_b)
+            random.shuffle(indices)
+            return indices
 
-                loss_rm = (
-                    F.softplus(-(r_pos - r_rand)) +
-                    F.softplus(-(r_pos - r_a)) +
-                    F.softplus(-(r_pos - r_b))
-                ).mean()
+        if rm is not None:
+            print("[RM] Pretraining reward model...")
+            opt_rm = torch.optim.AdamW(rm.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            rm_steps = max(500, args.dpo_steps // 4)
 
-            scaler_rm.scale(loss_rm).backward()
-            scaler_rm.unscale_(opt_rm)
-            torch.nn.utils.clip_grad_norm_(rm.parameters(), 1.0)
-            scaler_rm.step(opt_rm)
-            scaler_rm.update()
+            for step in tqdm(range(rm_steps), desc="RM pretrain"):
+                sl = sample_balanced_indices(args.dpo_batch)
+                batch_q = [dpo_q[i] for i in sl]
+                gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
 
-        print("[RM] done.")
-        rm.eval()
-        for p in rm.parameters():
-            p.requires_grad = False
+                cand_tok = build_cand_tok_batch(batch_q, tgt_tok=gt_tok, use_retrieval=bool(args.train_mask))
+                q_x = build_query_tensor(batch_q).to(device, non_blocking=True)
+
+                opt_rm.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=use_amp):
+                    enc = q_enc(q_x)
+                    seq_a = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=0.7)
+                    seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
+
+                    rnd_tok = []
+                    for _ in batch_q:
+                        kk = args.topk
+                        ids = [vocab.offset + random.randrange(len(a_ids)) for _ in range(kk)]
+                        rnd_tok.append(ids)
+                    rnd_tok = torch.tensor(rnd_tok, dtype=torch.long, device=device)
+
+                    r_pos = rm(enc, gt_tok)
+                    r_rand = rm(enc, rnd_tok)
+                    r_a = rm(enc, seq_a)
+                    r_b = rm(enc, seq_b)
+
+                    loss_rm = (
+                        F.softplus(-(r_pos - r_rand)) +
+                        F.softplus(-(r_pos - r_a)) +
+                        F.softplus(-(r_pos - r_b))
+                    ).mean()
+
+                scaler_rm.scale(loss_rm).backward()
+                scaler_rm.unscale_(opt_rm)
+                torch.nn.utils.clip_grad_norm_(rm.parameters(), 1.0)
+                scaler_rm.step(opt_rm)
+                scaler_rm.update()
+
+            print("[RM] done.")
+            rm.eval()
+            for p in rm.parameters():
+                p.requires_grad = False
+        else:
+            print("[RM] skipped (using GT-based reward for DPO).")
 
         # optionally freeze query encoder during DPO
         if args.freeze_q_enc_dpo:
@@ -1309,7 +1378,7 @@ def main():
         update_steps = 0
         skipped_keep = 0
         for step in tqdm(range(args.dpo_steps), desc="Lite-DPO"):
-            sl = random.sample(range(len(dpo_q)), min(args.dpo_batch, len(dpo_q)))
+            sl = sample_balanced_indices(args.dpo_batch)
             batch_q = [dpo_q[i] for i in sl]
             gt_tok = torch.tensor([dpo_tgt[i] for i in sl], dtype=torch.long, device=device)
 
@@ -1322,8 +1391,12 @@ def main():
                 seq_b = gen.generate(enc, topk=args.topk, cand_tok=cand_tok, temperature=1.3)
 
             with torch.no_grad():
-                r_a = rm(enc, seq_a)
-                r_b = rm(enc, seq_b)
+                if rm is not None:
+                    r_a = rm(enc, seq_a)
+                    r_b = rm(enc, seq_b)
+                else:
+                    r_a = reward_from_gt(seq_a, gt_tok, pad_tok=vocab.PAD, offset=vocab.offset)
+                    r_b = reward_from_gt(seq_b, gt_tok, pad_tok=vocab.PAD, offset=vocab.offset)
                 prefer_a = (r_a >= r_b)
                 margin = 0.01
                 keep = (r_a - r_b).abs() >= margin
