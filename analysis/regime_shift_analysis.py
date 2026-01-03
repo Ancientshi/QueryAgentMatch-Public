@@ -19,6 +19,7 @@ from typing import Iterable, List, Sequence
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import MaxNLocator  # NEW
 
 from agent_rec.config import pos_topk_for_part
 from agent_rec.data import DatasetBundle, collect_data
@@ -149,65 +150,115 @@ def _apply_nips_style() -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
 
 
-def _plot_frequency(ax, stats: PartStats, color: str, title: str, log_x: bool = False) -> None:
+def _plot_frequency(
+    ax,
+    stats: PartStats,
+    color: str,
+    title: str,
+    log_x: bool = False,
+    log_y: bool = True,
+    y_max: float | None = None,
+    max_yticks: int | None = None,  # NEW
+) -> None:
     freqs = [cnt for _, cnt in stats.agent_degree.most_common()]
     xs = range(1, len(freqs) + 1)
     ax.plot(xs, freqs, color=color, linewidth=2, label=title.split(":")[0])
     ax.set_title(title)
     ax.set_xlabel("Agent rank by positives")
     ax.set_ylabel("#Positive assignments")
-    ax.set_yscale("log")
+    if log_y:
+        ax.set_yscale("log")
     if log_x:
         ax.set_xscale("log")
+    if y_max is not None:
+        ax.set_ylim(0, y_max)
+    if max_yticks is not None:
+        ax.yaxis.set_major_locator(MaxNLocator(nbins=max_yticks))  # NEW
     ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.6)
     ax.legend(frameon=False)
+
+
+def _plot_degree_hist(ax, stats: PartStats, color: str) -> None:
+    bins = 40
+    degrees = [v for v in stats.degree_values() if v > 0]
+    if not degrees:
+        return
+
+    # NOTE: removed p99.5 capping entirely (as requested)
+    ax.hist(
+        degrees,
+        bins=bins,
+        alpha=0.6,
+        label=stats.label,
+        log=True,
+        color=color,
+        edgecolor="white",
+        linewidth=0.5,
+    )
+    ax.set_title(f"{stats.label}: Agent-degree distribution (log)")
+    ax.set_xlabel("#Positive assignments per agent")
+    ax.set_ylabel("Agent count (log)")
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.legend(frameon=True)
 
 
 def plot_regime_shift(per_part: Sequence[PartStats], output_path: Path) -> None:
     _apply_nips_style()
     color_map = {
-        "PartI": "#1f77b4",  # blue
+        "PartI": "#1f77b4",   # blue
         "PartII": "#d62728",  # red
-        "PartIII": "#9467bd",  # purple
+        "PartIII": "#9467bd", # purple
     }
 
-    fig, axes = plt.subplots(1, 4, figsize=(21, 4.5), gridspec_kw={"wspace": 0.25})
+    # 3 frequency plots + 3 separate degree plots
+    fig, axes = plt.subplots(2, 3, figsize=(21, 9.0), gridspec_kw={"wspace": 0.25, "hspace": 0.35})
 
     part_lookup = {"/".join(s.parts): s for s in per_part}
     part_i = part_lookup.get("PartI")
     part_ii = part_lookup.get("PartII")
     part_iii = part_lookup.get("PartIII")
 
+    # Row 0: frequency curves
     if part_i:
-        _plot_frequency(axes[0], part_i, color_map["PartI"], "Part I: Agent frequency curve", log_x=False)
-    if part_ii:
-        _plot_frequency(axes[1], part_ii, color_map["PartII"], "Part II: Agent frequency curve", log_x=True)
-    if part_iii:
-        _plot_frequency(axes[2], part_iii, color_map["PartIII"], "Part III: Agent frequency curve", log_x=True)
-
-    bins = 40
-    percentile_cap = 99.5
-    for stats in per_part:
-        degrees = [v for v in stats.degree_values() if v > 0]
-        if not degrees:
-            continue
-        cap = float(np.percentile(degrees, percentile_cap)) if len(degrees) > 1 else degrees[0]
-        clipped = [min(v, cap) for v in degrees]
-        axes[3].hist(
-            clipped,
-            bins=bins,
-            alpha=0.45,
-            label=stats.label,
-            log=True,
-            color=color_map.get(stats.label, "#333333"),
-            edgecolor="white",
-            linewidth=0.5,
+        _plot_frequency(
+            axes[0, 0],
+            part_i,
+            color_map["PartI"],
+            "Part I: Agent frequency curve",
+            log_x=False,
+            log_y=True,
         )
-    axes[3].set_title("Agent-degree distribution (log-scaled, p99.5 capped)")
-    axes[3].set_xlabel("#Positive assignments per agent")
-    axes[3].set_ylabel("Agent count (log)")
-    axes[3].grid(True, linestyle="--", linewidth=0.8, alpha=0.6)
-    axes[3].legend(frameon=True)
+    if part_ii:
+        _plot_frequency(
+            axes[0, 1],
+            part_ii,
+            color_map["PartII"],
+            "Part II: Agent frequency curve",
+            log_x=True,
+            log_y=True,
+        )
+    if part_iii:
+        # Part III: make y ticks sparse + keep y-limit = max + 1
+        freqs = [cnt for _, cnt in part_iii.agent_degree.most_common()]
+        y_max = (max(freqs) + 1) if freqs else 1
+        _plot_frequency(
+            axes[0, 2],
+            part_iii,
+            color_map["PartIII"],
+            "Part III: Agent frequency curve",
+            log_x=True,
+            log_y=False,
+            y_max=float(y_max),
+            max_yticks=4,  # NEW: fewer y ticks (less dense)
+        )
+
+    # Row 1: degree histograms (no percentile capping)
+    if part_i:
+        _plot_degree_hist(axes[1, 0], part_i, color_map["PartI"])
+    if part_ii:
+        _plot_degree_hist(axes[1, 1], part_ii, color_map["PartII"])
+    if part_iii:
+        _plot_degree_hist(axes[1, 2], part_iii, color_map["PartIII"])
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
