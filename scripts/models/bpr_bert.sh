@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../common_env.sh"
 
-EPOCHS=2
-BATCH_SIZE=128
+EPOCHS=5
+BATCH_SIZE=4096
 LR=1e-3
 DEVICE="cuda:0"
 
@@ -50,8 +50,8 @@ python "$SCRIPT_DIR/../../run_bpr_bert.py" \
   --encoder_lr "$ENCODER_LR" \
   --encoder_weight_decay "$ENCODER_WEIGHT_DECAY" \
   --use_query_id_emb 0 \
-  --use_llm_id_emb 0 \
-  --use_tool_id_emb 0 \
+  --use_llm_id_emb 1 \
+  --use_tool_id_emb 1 \
   --use_model_content_vector 1 \
   --use_tool_content_vector 1 \
-  --exp_name "bpr_bert_${TUNE_MODE}_content"
+  --exp_name "bpr_bert_${TUNE_MODE}"

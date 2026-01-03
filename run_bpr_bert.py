@@ -483,6 +483,7 @@ def main():
                 Q_emb,
                 A_model_emb,
                 A_tool_emb,
+                A_emb,
                 agent_tool_idx_padded_np,
                 agent_tool_mask_np,
                 agent_llm_idx_np,
