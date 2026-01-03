@@ -34,13 +34,19 @@ UNKNOWN_LLM = "<UNK_LLM>"
 
 
 def _agent_llm_and_tools(agent: Dict | None) -> Tuple[str, list[str]]:
-    """Return (llm_id, tools[]) for an agent object, with safe defaults."""
+    """
+    Return (llm_id_or_name, tools[]) for an agent object, with safe defaults.
+    Falls back to model name when id is missing to avoid lumping distinct LLMs
+    into <UNK_LLM>.
+    """
     agent = agent or {}
     model = agent.get("M") or {}
     tool_info = agent.get("T") or {}
-    llm_id = (model.get("id") or "").strip() or UNKNOWN_LLM
+    llm_id = (model.get("id") or "").strip()
+    llm_name = (model.get("name") or "").strip()
+    llm_token = llm_id or llm_name or UNKNOWN_LLM
     tools = list(tool_info.get("tools") or [])
-    return llm_id, tools
+    return llm_token, tools
 
 
 def _winsorize_counter(counter: Counter[str], percentile: float) -> Tuple[Counter[str], float]:

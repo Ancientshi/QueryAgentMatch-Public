@@ -24,7 +24,7 @@ The defaults cover Parts I/II/III, but you can limit analysis to a subset with `
 
 ## Popularity analysis (LLM/Tool frequency + agent popularity)
 
-`analysis/popularity_analysis.py` computes LLM frequencies, winsorized tool frequencies (99.5th percentile), caches them under `${data_root}/.cache/popularity_analysis_*`, derives per-agent popularity (LLM frequency + mean tool frequency), and plots the popularity curve.
+`analysis/popularity_analysis.py` computes LLM frequencies (using `M.id` or falling back to `M.name`), winsorized tool frequencies (99.5th percentile), caches them under `${data_root}/.cache/popularity_analysis_*`, derives per-agent popularity (LLM frequency + mean tool frequency), and plots the popularity curve.
 
 ### Usage
 
