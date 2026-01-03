@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
+import numpy as np
 
 from agent_rec.config import pos_topk_for_part
 from agent_rec.data import DatasetBundle, collect_data
@@ -56,9 +58,6 @@ class PartStats:
         top_n = max(1, math.ceil(len(self.agent_degree) * percentile / 100.0))
         covered = sum(cnt for _, cnt in self.agent_degree.most_common(top_n))
         return covered / self.positive_interactions
-
-    def sorted_frequencies(self) -> List[int]:
-        return [cnt for _, cnt in self.agent_degree.most_common()]
 
     def degree_values(self) -> List[int]:
         return list(self.agent_degree.values())
@@ -132,46 +131,83 @@ def export_metrics_table(stats_list: Sequence[PartStats], output_csv: Path) -> N
             )
 
 
-def plot_regime_shift(part_i: PartStats, combined_ii_iii: PartStats, per_part: Sequence[PartStats], output_path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+def _apply_nips_style() -> None:
+    mpl.rcParams.update(
+        {
+            "figure.dpi": 150,
+            "font.size": 12,
+            "axes.titlesize": 16,
+            "axes.labelsize": 13,
+            "legend.fontsize": 12,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "grid.alpha": 0.3,
+        }
+    )
+    plt.style.use("seaborn-v0_8-whitegrid")
 
-    # Left: Part I frequency curve
-    freq_i = part_i.sorted_frequencies()
-    axes[0].plot(range(1, len(freq_i) + 1), freq_i, color="#1f77b4")
-    axes[0].set_title("Part I: Agent frequency curve")
-    axes[0].set_xlabel("Agent rank by positives")
-    axes[0].set_ylabel("#Positive assignments")
-    axes[0].set_yscale("log")
-    axes[0].grid(True, linestyle="--", alpha=0.4)
 
-    # Right: Part II/III frequency curve
-    freq_ii_iii = combined_ii_iii.sorted_frequencies()
-    axes[1].plot(range(1, len(freq_ii_iii) + 1), freq_ii_iii, color="#d62728")
-    axes[1].set_title("Part II/III: Agent frequency curve")
-    axes[1].set_xlabel("Agent rank by positives")
-    axes[1].set_ylabel("#Positive assignments")
-    axes[1].set_yscale("log")
-    axes[1].grid(True, linestyle="--", alpha=0.4)
+def _plot_frequency(ax, stats: PartStats, color: str, title: str, log_x: bool = False) -> None:
+    freqs = [cnt for _, cnt in stats.agent_degree.most_common()]
+    xs = range(1, len(freqs) + 1)
+    ax.plot(xs, freqs, color=color, linewidth=2, label=title.split(":")[0])
+    ax.set_title(title)
+    ax.set_xlabel("Agent rank by positives")
+    ax.set_ylabel("#Positive assignments")
+    ax.set_yscale("log")
+    if log_x:
+        ax.set_xscale("log")
+    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.legend(frameon=False)
 
-    # Histogram / log-log view for agent-degree distribution (across parts)
+
+def plot_regime_shift(per_part: Sequence[PartStats], output_path: Path) -> None:
+    _apply_nips_style()
+    color_map = {
+        "PartI": "#1f77b4",  # blue
+        "PartII": "#d62728",  # red
+        "PartIII": "#9467bd",  # purple
+    }
+
+    fig, axes = plt.subplots(1, 4, figsize=(21, 4.5), gridspec_kw={"wspace": 0.25})
+
+    part_lookup = {"/".join(s.parts): s for s in per_part}
+    part_i = part_lookup.get("PartI")
+    part_ii = part_lookup.get("PartII")
+    part_iii = part_lookup.get("PartIII")
+
+    if part_i:
+        _plot_frequency(axes[0], part_i, color_map["PartI"], "Part I: Agent frequency curve", log_x=False)
+    if part_ii:
+        _plot_frequency(axes[1], part_ii, color_map["PartII"], "Part II: Agent frequency curve", log_x=True)
+    if part_iii:
+        _plot_frequency(axes[2], part_iii, color_map["PartIII"], "Part III: Agent frequency curve", log_x=True)
+
     bins = 40
-    for stats, color in zip(per_part, ["#1f77b4", "#d62728", "#9467bd"]):
+    percentile_cap = 99.5
+    for stats in per_part:
         degrees = [v for v in stats.degree_values() if v > 0]
         if not degrees:
             continue
-        axes[2].hist(
-            degrees,
+        cap = float(np.percentile(degrees, percentile_cap)) if len(degrees) > 1 else degrees[0]
+        clipped = [min(v, cap) for v in degrees]
+        axes[3].hist(
+            clipped,
             bins=bins,
-            alpha=0.5,
+            alpha=0.45,
             label=stats.label,
             log=True,
-            color=color,
+            color=color_map.get(stats.label, "#333333"),
+            edgecolor="white",
+            linewidth=0.5,
         )
-    axes[2].set_title("Agent-degree distribution (log-scaled)")
-    axes[2].set_xlabel("#Positive assignments per agent")
-    axes[2].set_ylabel("Agent count (log)")
-    axes[2].legend()
-    axes[2].grid(True, linestyle="--", alpha=0.4)
+    axes[3].set_title("Agent-degree distribution (log-scaled, p99.5 capped)")
+    axes[3].set_xlabel("#Positive assignments per agent")
+    axes[3].set_ylabel("Agent count (log)")
+    axes[3].grid(True, linestyle="--", linewidth=0.8, alpha=0.6)
+    axes[3].legend(frameon=True)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -207,22 +243,14 @@ def main() -> None:
         if part in parts:
             part_stats.append(collect_part_stats(bundle, [part]))
 
-    # Combined Part II/III for regime-shift right panel
-    combined = collect_part_stats(bundle, [p for p in ["PartII", "PartIII"] if p in parts])
-
     if not part_stats:
         raise ValueError(f"No part statistics collected. Check parts filter: {parts}")
 
     metrics_path = args.output_dir / "regime_shift_metrics.csv"
-    export_metrics_table(part_stats + ([combined] if combined.parts else []), metrics_path)
+    export_metrics_table(part_stats, metrics_path)
 
     figure_path = args.output_dir / "regime_shift_frequency.png"
-    plot_regime_shift(
-        part_i=next((s for s in part_stats if "PartI" in s.parts), part_stats[0]),
-        combined_ii_iii=combined if combined.parts else part_stats[-1],
-        per_part=part_stats,
-        output_path=figure_path,
-    )
+    plot_regime_shift(per_part=part_stats, output_path=figure_path)
 
     print(f"[OK] Metrics table saved to: {metrics_path}")
     print(f"[OK] Figure saved to: {figure_path}")

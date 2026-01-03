@@ -18,6 +18,6 @@ Requirements:
 Outputs (written to `--output_dir`):
 
 - `regime_shift_metrics.csv`: one table of per-part topology metrics (unique agent ratio, head coverage for top 1%/5%, entropy and effective directory size).
-- `regime_shift_frequency.png`: one figure with side-by-side frequency curves (Part I vs Part II/III) plus a log-scale agent-degree histogram.
+- `regime_shift_frequency.png`: NIPS-friendly visualization with three separate frequency curves (Part I, Part II, Part III) and a log-scale agent-degree histogram that caps tails at the 99.5th percentile to keep Parts II/III readable.
 
 The defaults cover Parts I/II/III, but you can limit analysis to a subset with `--parts PartI,PartII`.
