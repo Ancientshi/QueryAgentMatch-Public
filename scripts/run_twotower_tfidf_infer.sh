@@ -19,7 +19,7 @@ HOST=${HOST:-"0.0.0.0"}
 PORT=${PORT:-8000}
 DEVICE=${DEVICE:-"cpu"}
 TOPK=${TOPK:-10}
-MAX_FEATURES=${MAX_FEATURES:-8192}
+MAX_FEATURES=${MAX_FEATURES:-5000}
 
 if [[ -z "${DATA_ROOT}" || -z "${MODEL_PATH}" ]]; then
   echo "[error] Please set DATA_ROOT and MODEL_PATH before running." >&2
