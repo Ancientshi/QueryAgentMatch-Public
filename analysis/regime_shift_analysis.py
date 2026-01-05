@@ -554,7 +554,7 @@ def plot_regime_shift(per_part: Sequence[PartStats], output_path: Path) -> None:
         per_part,
         color_map=color_map,
         title="All parts: Agent frequency curve (segmented by dominant part)",
-        log_x=True,
+        log_x=False,
         log_y=True,
     )
     _plot_popularity_ccdf(axes[2, 2], per_part, color_map)
