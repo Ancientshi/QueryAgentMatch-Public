@@ -106,7 +106,7 @@ def _extract_agent_fields(all_agents: Dict[str, dict]) -> Tuple[List[str], List[
         m = (a.get("M") or {}) if isinstance(a, dict) else {}
         model_names.append((m.get("name") or "").strip())
         tool_lists.append(((a.get("T") or {}).get("tools") or []))
-        llm_ids.append((m.get("id") or "").strip())
+        llm_ids.append((m.get("id") or m.get("name") or "").strip())
     return a_ids, model_names, tool_lists, llm_ids
 
 
