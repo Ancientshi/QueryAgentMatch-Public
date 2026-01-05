@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
-#   DATA_ROOT=/path/to/dataset_root \
-#   MODEL_PATH=/path/to/models/latest_xxxx.pt \
-#   HOST=0.0.0.0 \
-#   PORT=8000 \
-#   DEVICE=cpu \
-#   TOPK=10 \
-#   ./scripts/run_twotower_tfidf_infer.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+
+DATA_ROOT=/home/yunxshi/Data/workspace/QueryAgentMatch/QueryAgentMatch-Public/dataset \
+MODEL_PATH=/home/yunxshi/Data/workspace/QueryAgentMatch/QueryAgentMatch-Public/dataset/.cache/two_tower_tfidf/models/latest_01915b90.pt \
+HOST=0.0.0.0 \
+PORT=8000 \
+DEVICE=cuda:0 \
+TOPK=10 \
+
 
 DATA_ROOT=${DATA_ROOT:-""}
 MODEL_PATH=${MODEL_PATH:-""}
@@ -23,7 +26,7 @@ if [[ -z "${DATA_ROOT}" || -z "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
-python infer_twotower_tfidf.py \
+python "$SCRIPT_DIR/../infer_twotower_tfidf.py" \
   --data_root "${DATA_ROOT}" \
   --model_path "${MODEL_PATH}" \
   --device "${DEVICE}" \
