@@ -27,7 +27,7 @@ from __future__ import annotations
 import argparse
 import os
 from functools import lru_cache
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,8 @@ from flask import Flask, jsonify, render_template_string, request
 
 from agent_rec.config import TFIDF_MAX_FEATURES
 from agent_rec.features import (
+    UNK_LLM_TOKEN,
+    UNK_TOOL_TOKEN,
     build_agent_content_view,
     feature_cache_exists,
     load_feature_cache,
@@ -127,7 +129,7 @@ HTML_TEMPLATE = """
             <li class="agent-card candidate">
               <div class="agent-title">{{ c.title }}</div>
               <div class="meta">LLM: {{ c.llm_name }}</div>
-              <div class="meta">Tool: {{ c.tool_name }}</div>
+              <div class="meta">Tools: {{ c.tools | join(', ') }}</div>
               <div class="meta">{{ c.reason }}</div>
             </li>
             {% endfor %}
@@ -248,6 +250,7 @@ class TwoTowerInference:
             with_tools=True,
         )
         self.bundle = boot.bundle
+        self.tools = boot.tools or {}
         ckpt = _load_checkpoint(model_path, device)
         self.ckpt_data_sig = ckpt.get("data_sig", boot.data_sig)
 
@@ -276,7 +279,22 @@ class TwoTowerInference:
         self.encoder.set_agent_features(self.agent_content)
         self.agent_embeddings = self.encoder.export_agent_embeddings()
         self.agent_ids = list(self.feature_cache.a_ids)
-        self.tools = boot.tools or {}
+        self.agent_id_to_index = {aid: i for i, aid in enumerate(self.agent_ids)}
+        self.agent_llm_ids = list(getattr(self.feature_cache, "llm_ids", []))
+        self.agent_tools: List[List[str]] = []
+        self.agent_llm_names: List[str] = []
+        for aid in self.agent_ids:
+            agent = self.bundle.all_agents.get(aid, {}) or {}
+            m = (agent.get("M") or {}) if isinstance(agent, dict) else {}
+            t = (agent.get("T") or {}) if isinstance(agent, dict) else {}
+            self.agent_llm_names.append((m.get("name") or m.get("id") or "").strip())
+            self.agent_tools.append(list((t.get("tools") or [])))
+        self.llm_vocab = [x for x in (self.feature_cache.llm_vocab or []) if x != UNK_LLM_TOKEN]
+        self.tool_vocab = [x for x in (self.feature_cache.tool_id_vocab or []) if x != UNK_TOOL_TOKEN]
+        self.tool_desc_map = {
+            name: (self.tools.get(name, {}) or {}).get("description", "")
+            for name in self.tool_vocab
+        }
 
     def _encode_query(self, query: str) -> np.ndarray:
         vec = self.q_vectorizer.transform([query]).toarray().astype(np.float32)
@@ -288,17 +306,40 @@ class TwoTowerInference:
             qe = self.encoder.encode_q(q, q_idx=q_idx).cpu().numpy()
         return qe
 
-    def recommend(self, query: str, topk: int | None = None) -> List[Tuple[str, float]]:
+    def score_all_agents(self, query: str) -> np.ndarray:
         query = (query or "").strip()
         if not query:
             raise ValueError("查询不能为空。")
-        k = topk or self.topk
         qe = self._encode_query(query)
         scores = np.dot(qe, self.agent_embeddings.T).reshape(-1)
+        return scores
+
+    def _top_agents_from_scores(
+        self, scores: np.ndarray, *, topk: int | None = None, candidate_ids: Sequence[str] | None = None
+    ) -> List[Tuple[str, float]]:
+        k = topk or self.topk
+        if candidate_ids:
+            candidate_idx = [self.agent_id_to_index[a] for a in candidate_ids if a in self.agent_id_to_index]
+            if candidate_idx:
+                sub_scores = np.array([scores[i] for i in candidate_idx], dtype=np.float32)
+                k = min(k, len(sub_scores))
+                idx = np.argpartition(-sub_scores, k - 1)[:k]
+                ordered = idx[np.argsort(-sub_scores[idx])]
+                return [(candidate_ids[i], float(sub_scores[i])) for i in ordered]
+        k = min(k, len(scores))
         k = min(k, len(scores))
         idx = np.argpartition(-scores, k - 1)[:k]
         ordered = idx[np.argsort(-scores[idx])]
         return [(self.agent_ids[i], float(scores[i])) for i in ordered]
+
+    def recommend(
+        self, query: str, topk: int | None = None, *, return_scores: bool = False
+    ) -> List[Tuple[str, float]] | Tuple[List[Tuple[str, float]], np.ndarray]:
+        scores = self.score_all_agents(query)
+        recs = self._top_agents_from_scores(scores, topk=topk)
+        if return_scores:
+            return recs, scores
+        return recs
 
     @lru_cache(maxsize=4096)
     def agent_detail(self, agent_id: str) -> Dict[str, object]:
@@ -327,15 +368,17 @@ class TwoTowerInference:
             "tool_details": tool_details,
         }
 
-    def recommend_llms(self, scored_agents: List[Tuple[str, float]], topk: int = 10) -> List[Dict[str, object]]:
-        """
-        将单个 LLM 包装为“虚拟 Agent”，返回按得分排序的 TopK。
-        """
+    def recommend_llms(self, scores: np.ndarray, topk: int = 10) -> List[Dict[str, object]]:
         best: Dict[str, Dict[str, object]] = {}
-        for aid, score in scored_agents:
+        for idx, score in enumerate(scores):
+            if idx >= len(self.agent_ids):
+                continue
+            aid = self.agent_ids[idx]
             detail = self.agent_detail(aid)
-            llm_id = detail.get("model_id") or detail.get("model_name") or "未知"
-            llm_name = detail.get("model_name") or llm_id
+            llm_id = (self.agent_llm_ids[idx] if idx < len(self.agent_llm_ids) else "") or detail.get("model_id") or detail.get("model_name") or ""
+            if not llm_id or llm_id == UNK_LLM_TOKEN:
+                continue
+            llm_name = detail.get("model_name") or self.agent_llm_names[idx] or llm_id
             if llm_id not in best or score > best[llm_id]["score"]:
                 best[llm_id] = {
                     "llm_id": llm_id,
@@ -347,19 +390,20 @@ class TwoTowerInference:
         ordered = sorted(best.values(), key=lambda x: -x["score"])
         return ordered[:topk]
 
-    def recommend_tools(self, scored_agents: List[Tuple[str, float]], topk: int = 10) -> List[Dict[str, object]]:
-        """
-        将单个 Tool 包装为“虚拟 Agent”，返回按得分排序的 TopK。
-        """
+    def recommend_tools(self, scores: np.ndarray, topk: int = 10) -> List[Dict[str, object]]:
         best: Dict[str, Dict[str, object]] = {}
-        for aid, score in scored_agents:
+        for idx, score in enumerate(scores):
+            if idx >= len(self.agent_ids):
+                continue
+            aid = self.agent_ids[idx]
+            tools = self.agent_tools[idx] if idx < len(self.agent_tools) else []
             detail = self.agent_detail(aid)
-            tool_details = detail.get("tool_details") or []
-            if not tool_details and detail.get("tools"):
-                tool_details = [{"name": t, "description": ""} for t in detail.get("tools", [])]
-            for t in tool_details:
-                name = t.get("name") or "未知"
-                desc = t.get("description") or ""
+            if not tools:
+                tools = detail.get("tools", [])
+            for name in tools:
+                if not name or name == UNK_TOOL_TOKEN:
+                    continue
+                desc = self.tool_desc_map.get(name) or ""
                 if name not in best or score > best[name]["score"]:
                     best[name] = {
                         "tool_name": name,
@@ -388,23 +432,93 @@ class TwoTowerInference:
         max_pairs = min(topk, max(len(llm_recs), len(tool_recs)))
         for i in range(max_pairs):
             llm = llm_recs[i % len(llm_recs)]
-            tool = tool_recs[i % len(tool_recs)]
-            title = f"{llm['llm_name']} × {tool['tool_name']}"
+            tool_candidates = [tool_recs[i % len(tool_recs)]["tool_name"]]
+            if len(tool_recs) > 1 and tool_recs[(i + 1) % len(tool_recs)]["tool_name"] not in tool_candidates:
+                tool_candidates.append(tool_recs[(i + 1) % len(tool_recs)]["tool_name"])
+            title = f"{llm['llm_name']} × {', '.join(tool_candidates)}"
             reason = (
                 f"让 {llm['llm_name']} 负责理解“{q}”，"
-                f"并通过 {tool['tool_name']} 提供的能力完成关键动作。"
+                f"并通过 {', '.join(tool_candidates)} 提供的能力完成关键动作。"
             )
             suggestions.append(
                 {
                     "title": title,
                     "llm_name": llm.get("llm_name", ""),
-                    "tool_name": tool.get("tool_name", ""),
+                    "llm_id": llm.get("llm_id", ""),
+                    "tools": tool_candidates,
                     "reason": reason,
                 }
             )
             if len(suggestions) >= topk:
                 break
         return suggestions
+
+    def _expand_candidate_combinations(
+        self,
+        suggestions: List[Dict[str, object]],
+        llm_recs: List[Dict[str, object]],
+        tool_recs: List[Dict[str, object]],
+        max_candidates: int = 50,
+    ) -> List[Dict[str, object]]:
+        combos: List[Dict[str, object]] = []
+        seen = set()
+        llm_pool = llm_recs[: min(len(llm_recs), 5)]
+        tool_pool = tool_recs[: min(len(tool_recs), 5)]
+
+        def add_combo(llm_id: str, llm_name: str, tools: Iterable[str]) -> None:
+            tools_set = tuple(sorted({t for t in tools if t}))
+            key = (llm_id or llm_name or "", tools_set)
+            if not key[0] or key in seen or len(combos) >= max_candidates:
+                return
+            seen.add(key)
+            combos.append({"llm_id": llm_id or "", "llm_name": llm_name or llm_id, "tools": list(tools_set)})
+
+        for s in suggestions:
+            base_tools = s.get("tools") or []
+            add_combo(s.get("llm_id", ""), s.get("llm_name", ""), base_tools)
+            for lp in llm_pool:
+                add_combo(lp.get("llm_id", ""), lp.get("llm_name", ""), base_tools)
+            for tp in tool_pool:
+                add_combo(s.get("llm_id", ""), s.get("llm_name", ""), base_tools + [tp.get("tool_name", "")])
+            for t in base_tools:
+                trimmed = [x for x in base_tools if x != t]
+                add_combo(s.get("llm_id", ""), s.get("llm_name", ""), trimmed)
+
+        return combos
+
+    def _agent_matches_combo(self, agent_idx: int, combo: Dict[str, object]) -> bool:
+        llm_target = (combo.get("llm_id") or combo.get("llm_name") or "").lower()
+        agent_llm_candidates = {
+            (self.agent_llm_ids[agent_idx] if agent_idx < len(self.agent_llm_ids) else "").lower(),
+            (self.agent_llm_names[agent_idx] if agent_idx < len(self.agent_llm_names) else "").lower(),
+        }
+        if llm_target and llm_target not in agent_llm_candidates:
+            return False
+        tools_target = set(combo.get("tools") or [])
+        agent_tools = set(self.agent_tools[agent_idx]) if agent_idx < len(self.agent_tools) else set()
+        if tools_target and not tools_target.issubset(agent_tools):
+            return False
+        return True
+
+    def build_candidate_pool(
+        self, combos: List[Dict[str, object]], *, fallback_to_all: bool = True
+    ) -> List[str]:
+        if not combos:
+            return list(self.agent_ids) if fallback_to_all else []
+        matched: List[str] = []
+        for idx, aid in enumerate(self.agent_ids):
+            for combo in combos:
+                if self._agent_matches_combo(idx, combo):
+                    matched.append(aid)
+                    break
+        if not matched and fallback_to_all:
+            return list(self.agent_ids)
+        return matched
+
+    def rerank_candidates(
+        self, scores: np.ndarray, candidate_ids: List[str], *, topk: int | None = None
+    ) -> List[Tuple[str, float]]:
+        return self._top_agents_from_scores(scores, topk=topk, candidate_ids=candidate_ids)
 
 
 def build_app(infer: TwoTowerInference) -> Flask:
@@ -420,11 +534,14 @@ def build_app(infer: TwoTowerInference) -> Flask:
         query = request.form.get("query", "") if request.method == "POST" else ""
         if request.method == "POST":
             try:
-                recs = infer.recommend(query)
-                results = [_merge_detail(infer.agent_detail(aid), score) for aid, score in recs]
-                llm_recs = infer.recommend_llms(recs)
-                tool_recs = infer.recommend_tools(recs)
+                scores = infer.score_all_agents(query)
+                llm_recs = infer.recommend_llms(scores)
+                tool_recs = infer.recommend_tools(scores)
                 candidates = infer.compose_agent_candidates(query, llm_recs, tool_recs)
+                expanded = infer._expand_candidate_combinations(candidates, llm_recs, tool_recs)
+                candidate_pool = infer.build_candidate_pool(expanded)
+                reranked = infer.rerank_candidates(scores, candidate_pool, topk=infer.topk)
+                results = [_merge_detail(infer.agent_detail(aid), score) for aid, score in reranked]
             except Exception as e:  # pragma: no cover - runtime feedback
                 error = str(e)
         return render_template_string(
@@ -443,11 +560,14 @@ def build_app(infer: TwoTowerInference) -> Flask:
         query = data.get("query", "")
         topk = int(data.get("topk", infer.topk))
         try:
-            recs = infer.recommend(query, topk=topk)
-            payload = [_merge_detail(infer.agent_detail(aid), score) for aid, score in recs]
-            llm_recs = infer.recommend_llms(recs)
-            tool_recs = infer.recommend_tools(recs)
-            candidates = infer.compose_agent_candidates(query, llm_recs, tool_recs)
+            scores = infer.score_all_agents(query)
+            llm_recs = infer.recommend_llms(scores, topk=topk)
+            tool_recs = infer.recommend_tools(scores, topk=topk)
+            candidates = infer.compose_agent_candidates(query, llm_recs, tool_recs, topk=topk)
+            expanded = infer._expand_candidate_combinations(candidates, llm_recs, tool_recs)
+            candidate_pool = infer.build_candidate_pool(expanded)
+            reranked = infer.rerank_candidates(scores, candidate_pool, topk=topk)
+            payload = [_merge_detail(infer.agent_detail(aid), score) for aid, score in reranked]
             return jsonify(
                 {
                     "query": query,
@@ -455,6 +575,7 @@ def build_app(infer: TwoTowerInference) -> Flask:
                     "llm_recs": llm_recs,
                     "tool_recs": tool_recs,
                     "candidates": candidates,
+                    "candidate_pool_size": len(candidate_pool),
                 }
             )
         except Exception as e:  # pragma: no cover - runtime feedback
