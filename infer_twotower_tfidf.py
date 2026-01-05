@@ -52,21 +52,27 @@ HTML_TEMPLATE = """
   <title>TwoTower TF-IDF Agent 推荐</title>
   <style>
     body { font-family: "Helvetica Neue", Arial, sans-serif; background: #f5f6fa; }
-    .container { max-width: 900px; margin: 60px auto; background: #fff; padding: 32px; border-radius: 12px; box-shadow: 0 4px 30px rgba(0,0,0,0.08); }
+    .container { max-width: 1200px; margin: 60px auto; background: #fff; padding: 32px; border-radius: 12px; box-shadow: 0 4px 30px rgba(0,0,0,0.08); }
     h1 { text-align: center; margin-bottom: 12px; }
     p.subtitle { text-align: center; color: #555; margin-top: 0; }
     form { display: flex; gap: 12px; justify-content: center; align-items: center; margin-bottom: 24px; }
     input[type=text] { width: 100%; max-width: 620px; padding: 14px 18px; font-size: 16px; border: 1px solid #dcdde1; border-radius: 10px; box-sizing: border-box; }
     button { padding: 14px 22px; font-size: 16px; background: #2d8cf0; color: #fff; border: none; border-radius: 10px; cursor: pointer; }
     button:hover { background: #1d7cd9; }
-    .results ol { padding-left: 22px; }
-    .agent-card { border: 1px solid #ecf0f1; border-radius: 10px; padding: 14px; margin-bottom: 12px; background: #fbfcfe; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+    .panel { border: 1px solid #ecf0f1; border-radius: 12px; padding: 14px 14px 4px; background: #fbfcfe; box-shadow: 0 1px 12px rgba(0,0,0,0.03); }
+    .panel h2 { margin: 0 0 8px; font-size: 17px; display: flex; align-items: center; gap: 6px; }
+    .panel small { color: #777; font-weight: 400; }
+    .results ol, .results ul { padding-left: 18px; margin: 0; }
+    .agent-card { border: 1px solid #ecf0f1; border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: #fff; }
     .agent-header { display: flex; justify-content: space-between; align-items: center; }
-    .agent-title { font-weight: 600; font-size: 17px; }
-    .agent-id { color: #888; font-size: 13px; }
-    .score { color: #2d8cf0; font-weight: 600; }
-    .meta { color: #444; margin-top: 6px; line-height: 1.5; }
-    .tools { margin-top: 6px; color: #555; }
+    .agent-title { font-weight: 600; font-size: 16px; }
+    .agent-id { color: #888; font-size: 12px; }
+    .score { color: #2d8cf0; font-weight: 600; font-size: 14px; }
+    .meta { color: #444; margin-top: 4px; line-height: 1.5; font-size: 13px; }
+    .tools { margin-top: 6px; color: #555; font-size: 13px; }
+    .candidate { border-left: 3px solid #2d8cf0; padding-left: 10px; margin-bottom: 10px; }
+    .pill { display: inline-block; background: #eef5ff; color: #2d8cf0; border-radius: 999px; padding: 3px 10px; font-size: 12px; margin-right: 6px; }
     .error { color: #c0392b; text-align: center; margin-bottom: 12px; }
   </style>
 </head>
@@ -80,37 +86,87 @@ HTML_TEMPLATE = """
     </form>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     {% if results %}
-    <div class="results">
-      <ol>
-        {% for r in results %}
-        <li>
-          <div class="agent-card">
-            <div class="agent-header">
-              <div>
-                <div class="agent-title">{{ r.display_name }}</div>
-                <div class="agent-id">ID: {{ r.agent_id }}</div>
+      <div class="results grid">
+        <div class="panel">
+          <h2>LLM 推荐 <small>Top 10</small></h2>
+          <ol>
+            {% for item in llm_recs %}
+            <li class="agent-card">
+              <div class="agent-header">
+                <div class="agent-title">{{ item.llm_name }}</div>
+                <div class="score">{{ '%.4f'|format(item.score) }}</div>
               </div>
-              <div class="score">score={{ '%.4f'|format(r.score) }}</div>
-            </div>
-            <div class="meta">模型: {{ r.model_name or '未知模型' }} ({{ r.model_id or '未提供ID' }})</div>
-            {% if r.model_desc %}<div class="meta">模型描述: {{ r.model_desc }}</div>{% endif %}
-            {% if r.tools %}
-              <div class="tools"><strong>工具:</strong> {{ r.tools | join(', ') }}</div>
-            {% endif %}
-            {% if r.tool_details %}
-              <div class="tools"><strong>工具详情:</strong>
-                <ul>
-                {% for t in r.tool_details %}
-                  <li>{{ t.name }}{% if t.description %}: {{ t.description }}{% endif %}</li>
-                {% endfor %}
-                </ul>
+              <div class="meta">LLM ID: {{ item.llm_id or '未知' }}</div>
+              <div class="meta">来源 Agent: {{ item.source_agent }}</div>
+              {% if item.desc %}<div class="meta">{{ item.desc }}</div>{% endif %}
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+
+        <div class="panel">
+          <h2>Tool 推荐 <small>Top 10</small></h2>
+          <ol>
+            {% for item in tool_recs %}
+            <li class="agent-card">
+              <div class="agent-header">
+                <div class="agent-title">{{ item.tool_name }}</div>
+                <div class="score">{{ '%.4f'|format(item.score) }}</div>
               </div>
-            {% endif %}
-          </div>
-        </li>
-        {% endfor %}
-      </ol>
-    </div>
+              <div class="meta">来源 Agent: {{ item.source_agent }}</div>
+              {% if item.desc %}<div class="meta">{{ item.desc }}</div>{% endif %}
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+
+        <div class="panel">
+          <h2>Agent 候选（GPT 提示）</h2>
+          <ol>
+            {% for c in candidates %}
+            <li class="agent-card candidate">
+              <div class="agent-title">{{ c.title }}</div>
+              <div class="meta">LLM: {{ c.llm_name }}</div>
+              <div class="meta">Tool: {{ c.tool_name }}</div>
+              <div class="meta">{{ c.reason }}</div>
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+
+        <div class="panel">
+          <h2>模型重排结果 <small>Top {{ results|length }}</small></h2>
+          <ol>
+            {% for r in results %}
+            <li>
+              <div class="agent-card">
+                <div class="agent-header">
+                  <div>
+                    <div class="agent-title">{{ r.display_name }}</div>
+                    <div class="agent-id">ID: {{ r.agent_id }}</div>
+                  </div>
+                  <div class="score">score={{ '%.4f'|format(r.score) }}</div>
+                </div>
+                <div class="meta">模型: {{ r.model_name or '未知模型' }} ({{ r.model_id or '未提供ID' }})</div>
+                {% if r.model_desc %}<div class="meta">模型描述: {{ r.model_desc }}</div>{% endif %}
+                {% if r.tools %}
+                  <div class="tools"><strong>工具:</strong> {{ r.tools | join(', ') }}</div>
+                {% endif %}
+                {% if r.tool_details %}
+                  <div class="tools"><strong>工具详情:</strong>
+                    <ul>
+                    {% for t in r.tool_details %}
+                      <li>{{ t.name }}{% if t.description %}: {{ t.description }}{% endif %}</li>
+                    {% endfor %}
+                    </ul>
+                  </div>
+                {% endif %}
+              </div>
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+      </div>
     {% endif %}
   </div>
 </body>
@@ -271,6 +327,85 @@ class TwoTowerInference:
             "tool_details": tool_details,
         }
 
+    def recommend_llms(self, scored_agents: List[Tuple[str, float]], topk: int = 10) -> List[Dict[str, object]]:
+        """
+        将单个 LLM 包装为“虚拟 Agent”，返回按得分排序的 TopK。
+        """
+        best: Dict[str, Dict[str, object]] = {}
+        for aid, score in scored_agents:
+            detail = self.agent_detail(aid)
+            llm_id = detail.get("model_id") or detail.get("model_name") or "未知"
+            llm_name = detail.get("model_name") or llm_id
+            if llm_id not in best or score > best[llm_id]["score"]:
+                best[llm_id] = {
+                    "llm_id": llm_id,
+                    "llm_name": llm_name,
+                    "score": score,
+                    "source_agent": detail.get("display_name") or aid,
+                    "desc": detail.get("model_desc") or "",
+                }
+        ordered = sorted(best.values(), key=lambda x: -x["score"])
+        return ordered[:topk]
+
+    def recommend_tools(self, scored_agents: List[Tuple[str, float]], topk: int = 10) -> List[Dict[str, object]]:
+        """
+        将单个 Tool 包装为“虚拟 Agent”，返回按得分排序的 TopK。
+        """
+        best: Dict[str, Dict[str, object]] = {}
+        for aid, score in scored_agents:
+            detail = self.agent_detail(aid)
+            tool_details = detail.get("tool_details") or []
+            if not tool_details and detail.get("tools"):
+                tool_details = [{"name": t, "description": ""} for t in detail.get("tools", [])]
+            for t in tool_details:
+                name = t.get("name") or "未知"
+                desc = t.get("description") or ""
+                if name not in best or score > best[name]["score"]:
+                    best[name] = {
+                        "tool_name": name,
+                        "score": score,
+                        "source_agent": detail.get("display_name") or aid,
+                        "desc": desc,
+                    }
+        ordered = sorted(best.values(), key=lambda x: -x["score"])
+        return ordered[:topk]
+
+    def compose_agent_candidates(
+        self,
+        query: str,
+        llm_recs: List[Dict[str, object]],
+        tool_recs: List[Dict[str, object]],
+        topk: int = 10,
+    ) -> List[Dict[str, object]]:
+        """
+        模拟 GPT 提示，利用 LLM/Tool 候选组合出可落地的 Agent 设想。
+        """
+        if not llm_recs or not tool_recs:
+            return []
+
+        suggestions: List[Dict[str, object]] = []
+        q = query.strip() or "当前任务"
+        max_pairs = min(topk, max(len(llm_recs), len(tool_recs)))
+        for i in range(max_pairs):
+            llm = llm_recs[i % len(llm_recs)]
+            tool = tool_recs[i % len(tool_recs)]
+            title = f"{llm['llm_name']} × {tool['tool_name']}"
+            reason = (
+                f"让 {llm['llm_name']} 负责理解“{q}”，"
+                f"并通过 {tool['tool_name']} 提供的能力完成关键动作。"
+            )
+            suggestions.append(
+                {
+                    "title": title,
+                    "llm_name": llm.get("llm_name", ""),
+                    "tool_name": tool.get("tool_name", ""),
+                    "reason": reason,
+                }
+            )
+            if len(suggestions) >= topk:
+                break
+        return suggestions
+
 
 def build_app(infer: TwoTowerInference) -> Flask:
     app = Flask(__name__)
@@ -279,14 +414,28 @@ def build_app(infer: TwoTowerInference) -> Flask:
     def index():
         error = None
         results: List[Dict[str, object]] = []
+        llm_recs: List[Dict[str, object]] = []
+        tool_recs: List[Dict[str, object]] = []
+        candidates: List[Dict[str, object]] = []
         query = request.form.get("query", "") if request.method == "POST" else ""
         if request.method == "POST":
             try:
                 recs = infer.recommend(query)
                 results = [_merge_detail(infer.agent_detail(aid), score) for aid, score in recs]
+                llm_recs = infer.recommend_llms(recs)
+                tool_recs = infer.recommend_tools(recs)
+                candidates = infer.compose_agent_candidates(query, llm_recs, tool_recs)
             except Exception as e:  # pragma: no cover - runtime feedback
                 error = str(e)
-        return render_template_string(HTML_TEMPLATE, query=query, results=results, error=error)
+        return render_template_string(
+            HTML_TEMPLATE,
+            query=query,
+            results=results,
+            error=error,
+            llm_recs=llm_recs,
+            tool_recs=tool_recs,
+            candidates=candidates,
+        )
 
     @app.route("/api/recommend", methods=["POST"])
     def api_recommend():
@@ -296,7 +445,18 @@ def build_app(infer: TwoTowerInference) -> Flask:
         try:
             recs = infer.recommend(query, topk=topk)
             payload = [_merge_detail(infer.agent_detail(aid), score) for aid, score in recs]
-            return jsonify({"query": query, "results": payload})
+            llm_recs = infer.recommend_llms(recs)
+            tool_recs = infer.recommend_tools(recs)
+            candidates = infer.compose_agent_candidates(query, llm_recs, tool_recs)
+            return jsonify(
+                {
+                    "query": query,
+                    "results": payload,
+                    "llm_recs": llm_recs,
+                    "tool_recs": tool_recs,
+                    "candidates": candidates,
+                }
+            )
         except Exception as e:  # pragma: no cover - runtime feedback
             return jsonify({"error": str(e)}), 400
 
